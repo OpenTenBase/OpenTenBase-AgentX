@@ -1,0 +1,28 @@
+{
+  "schema": "chuanxu-product-assets/v1",
+  "brand": "OpenTenBase AgentX",
+  "brand_zh": "OpenTenBase AgentX",
+  "product": "AI Agent Management Platform",
+  "technical_project": "OpenTenBase-AgentX",
+  "database": "PostgreSQL",
+  "edition": "Community",
+  "version": "5.0.4",
+  "release_date": "2026-11-05",
+  "source_commit": "6bee0d7db0f30f3d839053e4af7502fc19dbece1",
+  "assets": {
+    "opentenbase-mark.png": "cd90ea85f265f23de2b00bedd0fe4bdcf77521e758c658ca046d3841c786460c"
+  },
+  "icon_sprite": "../chuanxu-icons.svg",
+  "delivery_product": {
+    "key": "agentx-community",
+    "package": "OpenTenBase-AgentX",
+    "name_zh": "OpenTenBase AgentX",
+    "name_en": "OpenTenBase AgentX",
+    "databases": [
+      "pg"
+    ],
+    "edition": "Community",
+    "license": "Apache-2.0",
+    "brand": "agentx"
+  }
+}

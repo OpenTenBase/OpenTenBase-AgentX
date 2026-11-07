@@ -1,0 +1,2785 @@
+#!/usr/bin/env python3.14
+"""Read-only live database capability probe for current release evidence."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_repo_root() -> Path:
+    """Resolve the source root or the root of a generated package.
+
+    Source tools live at the repository root. Generated packages place the
+    tool under ``scripts/`` and keep ``build-manifest.json`` one directory
+    above it. Looking for the manifest avoids depending on the caller's
+    working directory while retaining the source-tree fallback.
+    """
+    if (_SCRIPT_DIR / "build-manifest.json").is_file():
+        return _SCRIPT_DIR
+    packaged_root = _SCRIPT_DIR.parent
+    if (packaged_root / "build-manifest.json").is_file():
+        return packaged_root
+    return _SCRIPT_DIR
+
+
+REPO_ROOT = _resolve_repo_root()
+
+
+def _migration_path(database: str, name: str) -> Path:
+    """Resolve every migration against the same source or package layout."""
+    if (REPO_ROOT / "build-manifest.json").is_file():
+        selected = REPO_ROOT / "scripts" / "deploy" / database / name
+        if selected.is_file():
+            return selected
+        return REPO_ROOT / "scripts" / "deploy" / name
+    return REPO_ROOT / "adapters" / database / "deploy" / name
+
+
+def _available_databases() -> tuple[str, ...]:
+    """Return all source adapters or the single adapter in a generated package."""
+    manifest_path = REPO_ROOT / "build-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        manifest = {}
+    key = str((manifest.get("database") or {}).get("key") or "").lower()
+    product_databases = (manifest.get("delivery_product") or {}).get("databases")
+    if product_databases is not None:
+        if (not isinstance(product_databases, list) or not product_databases
+                or any(item not in {"oracle", "pg", "yashandb"} for item in product_databases)
+                or len(set(product_databases)) != len(product_databases)):
+            raise ValueError("Invalid product database declaration")
+        return tuple(product_databases)
+    if key in {"oracle", "pg", "yashandb"}:
+        return (key,)
+    return ("oracle", "pg", "yashandb")
+
+
+CORE_TABLES = (
+    "ENTITIES", "AGENT_REGISTRY", "WORKSPACES", "TASK_PLANS", "TASK_STEPS",
+    "SKILL_META", "LOOP_RUNS", "SYSTEM_CONFIG",
+)
+V401_TABLES = (
+    "EXECUTION_JOBS", "EXECUTION_ATTEMPTS", "EXECUTION_POLICIES",
+    "EXECUTION_ARTIFACTS", "EXECUTION_AUDIT", "EVENT_DEAD_LETTER",
+    "DAG_EXECUTION_LOG", "ALERT_RULES",
+)
+REGISTRATION_TABLES = ("AGENT_REGISTRATIONS",)
+GOVERNANCE_TABLES = (
+    "GOV_RESOURCES", "GOV_POLICIES", "GOV_GRANTS", "GOV_DECISIONS",
+    "GOV_APPROVAL_REQUESTS", "GOV_APPROVAL_DECISIONS", "GOV_EMERGENCY_OPS",
+    "GOV_EMERGENCY_STEPS", "GOV_AUDIT_EVENTS", "GOV_AUDIT_RETENTION",
+    "GOV_LEGAL_HOLDS", "GOV_EVIDENCE_EXPORTS",
+)
+GRAPH_TABLES = (
+    "GRAPH_DEFINITIONS", "GRAPH_VERSIONS", "GRAPH_NODES", "GRAPH_EDGES",
+    "GRAPH_ALIASES", "GRAPH_TYPE_REGISTRY", "GRAPH_COMPILE_PLANS",
+    "GRAPH_RUNS", "GRAPH_NODE_RUNS", "GRAPH_ATTEMPTS", "GRAPH_READY_NODES",
+    "GRAPH_WORKERS", "GRAPH_LEASE_TOKENS", "GRAPH_CHECKPOINTS",
+    "GRAPH_STATE_EVENTS", "GRAPH_TRANSITIONS", "GRAPH_INBOX", "GRAPH_OUTBOX",
+    "GRAPH_ARTIFACTS", "GRAPH_EVALUATIONS", "GRAPH_INTERVENTIONS",
+    "GRAPH_JOIN_STATES", "GRAPH_RUN_BRANCHES", "GRAPH_WAIT_SUBSCRIPTIONS",
+    "GRAPH_TRACES", "GRAPH_RUN_MIGRATIONS", "GRAPH_COMPAT_BINDINGS",
+    "GRAPH_TRIGGERS", "GRAPH_EXECUTOR_REGISTRY", "GRAPH_GOVERNANCE_EVENTS",
+)
+
+
+# v4.3.0 is deliberately described here once and consumed by both the
+# read-only probe and migration_runner.py.  Keeping the contract beside the
+# probe also means generated packages ship the same validation rules as the
+# source tree without another packaging-only module.
+V43_MIGRATION_SCRIPTS = (
+    "16_v4_3_0_identity_channels.sql",
+    "17_v4_3_0_governance_lifecycle.sql",
+    "18_v4_3_0_security_lifecycle.sql",
+)
+
+V431_MIGRATION_SCRIPTS = V43_MIGRATION_SCRIPTS + (
+    "19_v4_3_1_organization_governance.sql",
+    "20_v4_3_1_human_display_name.sql",
+    "21_v4_3_1_entry_access.sql",
+    "22_v4_3_1_identity_organization_alignment.sql",
+)
+
+V432_MIGRATION_SCRIPTS = V431_MIGRATION_SCRIPTS + (
+    "23_v4_3_2_memory_lifecycle.sql",
+    "24_v4_3_2_memory_digest_alignment.sql",
+    "25_v4_3_2_disable_legacy_memory_fusion.sql",
+    "26_v4_3_2_snapshot_subject_fencing.sql",
+    "27_v4_3_2_memory_governance_completion.sql",
+)
+
+V433_MIGRATION_SCRIPTS = V432_MIGRATION_SCRIPTS + (
+    "28_v4_3_3_graph_assurance.sql",
+)
+
+V433_GRAPH_ASSURANCE_TABLES = (
+    "GRAPH_ASSURANCE_EVIDENCE", "GRAPH_DEFINITION_PROVENANCE", "GRAPH_DEFINITION_DEPENDENCIES",
+    "GRAPH_DEFINITION_SIGNATURES", "GRAPH_DEFINITION_SCANS", "GRAPH_DYNAMIC_PROPOSALS",
+    "GRAPH_PROTOCOL_TASKS", "GRAPH_TELEMETRY_DELIVERIES",
+)
+
+V434_MIGRATION_SCRIPTS = V433_MIGRATION_SCRIPTS + (
+    "29_v4_3_4_agent_compliance.sql",
+    "30_v4_3_4_compliance_hardening.sql",
+)
+V434_COMPLIANCE_TABLES = (
+    "CX_AGENT_PROFILES", "CX_AGENT_PROFILE_VERSIONS", "CX_AGENT_PROFILE_ASSIGNMENTS",
+    "CX_AGENT_ACTIVATIONS", "CX_AGENT_POSTURES", "CX_AGENT_POSTURE_EVIDENCE",
+    "CX_COMPLIANCE_FINDINGS", "CX_COMPLIANCE_REMEDIATION_CASES",
+    "CX_COMPLIANCE_EXCEPTIONS", "CX_COMPLIANCE_CONTROLLER_JOBS",
+)
+V434_COMPLIANCE_REQUIRED_COLUMNS = {
+    "CX_AGENT_PROFILES": frozenset({"PROFILE_ID", "PROFILE_KEY", "DISPLAY_NAME", "STATUS", "CREATED_BY"}),
+    "CX_AGENT_PROFILE_VERSIONS": frozenset({"PROFILE_VERSION_ID", "PROFILE_ID", "CONTENT_JSON", "CONTENT_DIGEST", "STATUS"}),
+    "CX_AGENT_PROFILE_ASSIGNMENTS": frozenset({"ASSIGNMENT_ID", "AGENT_ID", "PROFILE_VERSION_ID", "ENVIRONMENT", "STATUS"}),
+    "CX_AGENT_ACTIVATIONS": frozenset({"ACTIVATION_ID", "AGENT_ID", "EVIDENCE_STRENGTH", "BASELINE_DIGEST", "STATUS"}),
+    "CX_AGENT_POSTURES": frozenset({"POSTURE_ID", "AGENT_ID", "REGISTRATION_STATE", "RUNTIME_STATE", "POSTURE_STATE", "CONTROL_STATE", "VERSION"}),
+    "CX_AGENT_POSTURE_EVIDENCE": frozenset({"EVIDENCE_ID", "AGENT_ID", "EVIDENCE_TYPE", "PROVIDER", "PAYLOAD_DIGEST"}),
+    "CX_COMPLIANCE_FINDINGS": frozenset({"FINDING_ID", "AGENT_ID", "RULE_CODE", "SEVERITY", "STATUS", "DEADLINE_AT"}),
+    "CX_COMPLIANCE_REMEDIATION_CASES": frozenset({"CASE_ID", "FINDING_ID", "AGENT_ID", "STATUS", "RESPONSE_EVIDENCE_ID"}),
+    "CX_COMPLIANCE_EXCEPTIONS": frozenset({"EXCEPTION_ID", "POLICY_KEY", "REQUESTED_BY", "APPROVED_BY", "DECISION_REASON", "STATUS", "EXPIRES_AT"}),
+    "CX_COMPLIANCE_CONTROLLER_JOBS": frozenset({"JOB_ID", "JOB_TYPE", "STATUS", "FENCING_TOKEN", "IDEMPOTENCY_KEY"}),
+}
+
+V435_MIGRATION_SCRIPTS = V434_MIGRATION_SCRIPTS + (
+    "31_v4_3_5_platform_capabilities.sql",
+)
+V435_PLATFORM_TABLES = (
+    "CX_PLATFORM_CAPABILITIES", "CX_PLATFORM_CAPABILITY_DEPENDENCIES",
+    "CX_PLATFORM_CAPABILITY_HISTORY",
+)
+V435_PLATFORM_REQUIRED_COLUMNS = {
+    "CX_PLATFORM_CAPABILITIES": frozenset({
+        "CAPABILITY_KEY", "ENABLED", "MANDATORY", "VERSION", "UPDATED_BY",
+        "UPDATE_REASON", "CREATED_AT", "UPDATED_AT",
+    }),
+    "CX_PLATFORM_CAPABILITY_DEPENDENCIES": frozenset({"CAPABILITY_KEY", "DEPENDS_ON_KEY"}),
+    "CX_PLATFORM_CAPABILITY_HISTORY": frozenset({
+        "HISTORY_ID", "CAPABILITY_KEY", "FROM_ENABLED", "TO_ENABLED",
+        "RESULT_VERSION", "CHANGED_BY", "REASON", "CREATED_AT",
+    }),
+}
+
+V436_MIGRATION_SCRIPTS = V435_MIGRATION_SCRIPTS + (
+    "32_v4_3_6_native_agents.sql",
+)
+V437_MIGRATION_SCRIPTS = V436_MIGRATION_SCRIPTS + (
+    "33_v4_3_7_bootstrap_embedding.sql",
+)
+V440_MIGRATION_SCRIPTS = V437_MIGRATION_SCRIPTS + (
+    "34_v4_4_0_governed_sdd.sql",
+)
+V441_MIGRATION_SCRIPTS = V440_MIGRATION_SCRIPTS + (
+    "35_v4_4_1_admin_ha_upgrade.sql",
+    "36_v4_4_1_upgrade_protocol.sql",
+)
+V442_MIGRATION_SCRIPTS = V441_MIGRATION_SCRIPTS + (
+    "37_v4_4_2_embedding_graph_operations.sql",
+    "38_v4_4_2_channel_pinning.sql",
+)
+V443_MIGRATION_SCRIPTS = V442_MIGRATION_SCRIPTS + (
+    "39_v4_4_3_security_domain_binding.sql",
+)
+V444_MIGRATION_SCRIPTS = V443_MIGRATION_SCRIPTS + (
+    "40_v4_4_4_agent_pool_cloud.sql",
+    "41_v4_4_4_node_storage_binding.sql",
+    "42_v4_4_4_storage_purpose.sql",
+    "43_v4_4_4_agent_pool_node_onboarding.sql",
+    "44_v4_4_4_managed_node_local_info_path.sql",
+)
+V445_MIGRATION_SCRIPTS = V444_MIGRATION_SCRIPTS + (
+    "45_v4_4_5_graph_run_contract.sql",
+)
+V446_MIGRATION_SCRIPTS = V445_MIGRATION_SCRIPTS + (
+    "46_v4_4_6_identity_portal_graph.sql",
+    "47_v4_4_6_portable_contract_alignment.sql",
+)
+V448_MIGRATION_SCRIPTS = V446_MIGRATION_SCRIPTS + (
+    "48_v4_4_8_platform_agent_isolation.sql",
+)
+V449_MIGRATION_SCRIPTS = V446_MIGRATION_SCRIPTS + (
+    "50_v4_4_9_security_boundary_repair.sql",
+    "52_v4_4_9_local_identity_boundary.sql",
+    "54_v4_4_9_audit_data_contract.sql",
+)
+V410_MIGRATION_SCRIPTS = V449_MIGRATION_SCRIPTS + (
+    "55_v4_4_10_model_usage_wallboard.sql",
+    "56_v4_4_10_runtime_repair.sql",
+    "57_v4_4_10_complete_model_governance.sql",
+    "58_v4_4_10_knowledge_scope.sql",
+    "59_v4_4_10_knowledge_graph_context.sql",
+    "60_v4_4_10_organization_approval_closure.sql",
+    "61_v4_4_10_external_embedding_authorization.sql",
+    "62_v4_4_10_agent_embedding_contract.sql",
+    "63_v4_4_10_external_agent_gateway_grants.sql",
+    "64_v4_4_10_external_agent_context_repair.sql",
+    "65_v4_4_10_external_agent_domain_context.sql",
+)
+V411_MIGRATION_SCRIPTS = V410_MIGRATION_SCRIPTS + (
+    "66_v4_4_11_runtime_isolation_db4a2a.sql",
+    "67_v4_4_11_runtime_execution_admission.sql",
+    "68_v4_4_11_host_provisioning.sql",
+)
+# v4.5.1 and v4.5.2 are additive successors. Keep the historical chain
+# untouched and expose each successor as a separate, reviewable selector.
+V451_MIGRATION_SCRIPTS = V411_MIGRATION_SCRIPTS + (
+    "98_v4_5_1_agent_extensions.sql",
+    "99_v4_5_1_integration_bindings.sql",
+    "100_v4_5_1_framework_rootfs_digest.sql",
+)
+V452_MIGRATION_SCRIPTS = V451_MIGRATION_SCRIPTS + (
+    "101_v4_5_2_task_continuity.sql",
+)
+V500_MIGRATION_SCRIPTS = V452_MIGRATION_SCRIPTS + ("102_v5_0_0_network_access.sql",)
+V501_MIGRATION_SCRIPTS = V500_MIGRATION_SCRIPTS + (
+    "103_v5_0_1_memory_quality.sql", "104_v5_0_1_context_assets.sql",
+    "105_v5_0_1_answer_quality.sql",
+)
+V502_RUNTIME_MIGRATION_SCRIPTS = (
+    "106_v5_0_2_model_capacity.sql", "107_v5_0_2_processing_recovery.sql",
+    "108_v5_0_2_governed_model_turns.sql",
+    "109_v5_0_2_observed_answer_reviews.sql",
+)
+V502_MIGRATION_SCRIPTS = V501_MIGRATION_SCRIPTS + V502_RUNTIME_MIGRATION_SCRIPTS
+V502_NATIVE_MIGRATION_SCRIPTS = (
+    "103_v5_0_1_memory_quality.sql", "104_v5_0_1_context_assets.sql",
+    "105_v5_0_1_answer_quality.sql", *V502_RUNTIME_MIGRATION_SCRIPTS,
+)
+V502_PG_APPROVAL_REPAIR_SCRIPT = "110_v5_0_2_pg_approval_entity_repair.sql"
+V503_RUNTIME_MIGRATION_SCRIPTS = ("111_v5_0_3_knowledge_intake.sql","112_v5_0_3_native_knowledge_governance.sql","113_v5_0_3_authenticated_knowledge_write.sql","114_v5_0_3_legacy_shared_knowledge_write.sql")
+V503_YASHAN_GUARD_SCRIPT = '115_v5_0_3_yashandb_lob_knowledge_write.sql'
+V503_YASHAN_SEARCH_SCRIPT = '116_v5_0_3_yashandb_knowledge_body_search.sql'
+V503_TASK_TIMESTAMPS_SCRIPT = '117_v5_0_3_task_step_timestamps.sql'
+V503_ORACLE_COLLAB_SCRIPT = '118_v5_0_3_oracle_collab_document_key.sql'
+
+
+def v503_runtime_migration_scripts(database: str) -> tuple[str, ...]:
+    if database == 'yashandb':
+        # Retain the earlier draft SQL, but never execute its unsupported
+        # UPDATE OF CLOB syntax on fresh installs or declared upgrades.
+        return (V503_RUNTIME_MIGRATION_SCRIPTS[0], V503_YASHAN_GUARD_SCRIPT, V503_YASHAN_SEARCH_SCRIPT, V503_TASK_TIMESTAMPS_SCRIPT)
+    if database not in {'pg','postgresql','oracle'}:
+        raise ValueError('Unknown v5.0.3 database backend')
+    return V503_RUNTIME_MIGRATION_SCRIPTS + (V503_TASK_TIMESTAMPS_SCRIPT,) + ((V503_ORACLE_COLLAB_SCRIPT,) if database=='oracle' else ())
+
+
+def v503_migration_scripts(database: str) -> tuple[str, ...]:
+    return v502_migration_scripts(database) + v503_runtime_migration_scripts(database)
+
+
+V504_INCIDENT_SOURCE_SCRIPT = '119_v5_0_4_incident_sources.sql'
+
+
+def v504_runtime_migration_scripts(database: str) -> tuple[str, ...]:
+    v503_runtime_migration_scripts(database)  # Validate the selected backend.
+    return (V504_INCIDENT_SOURCE_SCRIPT,) + (('120_v5_0_4_pg_source_kind_repair.sql',) if database=='pg' else ())
+
+
+def v504_migration_scripts(database: str) -> tuple[str, ...]:
+    return v503_migration_scripts(database) + v504_runtime_migration_scripts(database)
+
+
+def validate_v504_static_contract(database: str, scripts: Sequence[Path], edition: str = 'enterprise') -> dict[str, Any]:
+    base = validate_v503_static_contract(database, scripts, edition)
+    try:
+        from lib.incident_source_schema import render
+    except ModuleNotFoundError:
+        from shared.lib.incident_source_schema import render
+    name, sql, facts = render(database)
+    matches = [p for p in scripts if p.name == name]
+    valid = False
+    if len(matches) == 1:
+        try:
+            valid = matches[0].read_text() == sql and json.loads(matches[0].with_suffix('.schema.json').read_text()) == facts
+        except (OSError, ValueError):
+            pass
+    if database=='pg':
+        try:
+            from lib.incident_source_pg_repair import render as repair
+        except ModuleNotFoundError:
+            from shared.lib.incident_source_pg_repair import render as repair
+        name, sql, facts = repair()
+        matches = [p for p in scripts if p.name == name]
+        try:
+            valid = valid and len(matches)==1 and matches[0].read_text()==sql and json.loads(matches[0].with_suffix('.schema.json').read_text())==facts
+        except (OSError,ValueError):
+            valid = False
+    return dict(database=database, v503=base, v504_incident_sources=dict(passed=valid), passed=base['passed'] and valid)
+
+
+def v502_runtime_migration_scripts(database: str) -> tuple[str, ...]:
+    if database not in {"pg", "postgresql", "oracle", "yashandb"}:
+        raise ValueError("Unknown v5.0.2 database backend")
+    return V502_RUNTIME_MIGRATION_SCRIPTS + ((V502_PG_APPROVAL_REPAIR_SCRIPT,) if database in {"pg", "postgresql"} else ())
+
+
+def v502_migration_scripts(database: str) -> tuple[str, ...]:
+    return V501_MIGRATION_SCRIPTS + v502_runtime_migration_scripts(database)
+
+
+def v502_native_migration_scripts(database: str) -> tuple[str, ...]:
+    return V501_MIGRATION_SCRIPTS[-3:] + v502_runtime_migration_scripts(database)
+
+
+V502_PG_APPROVAL_REPAIR_MANIFEST = {
+    "schema": "chuanxu-v502-pg-approval-entity-repair/v1", "database": "pg", "table": "APPROVAL_REQUESTS",
+    "removed_constraint": {"name": "CK_AR_ENTITY", "column": "ENTITY_TYPE", "allowed_values": ["STEP", "LOOP", "TOOL"]},
+    "required_constraints": {
+        "CK_APPROVAL_ENTITY": {"column": "ENTITY_TYPE", "allowed_values": ["STEP", "LOOP", "TOOL", "ORGANIZATION_CHANGE"]},
+        "CK_AR_STATUS": {"column": "APPROVAL_STATUS", "allowed_values": ["PENDING", "APPROVED", "REJECTED"]},
+    },
+    "grant_policy": "UNCHANGED", "preserve_other_constraints": True,
+}
+ENTERPRISE_ONLY_MIGRATION_SCRIPTS = frozenset({
+    "29_v4_3_4_agent_compliance.sql",
+    "30_v4_3_4_compliance_hardening.sql",
+})
+
+
+def migration_scripts_for_edition(
+    scripts: Sequence[str], edition: str,
+) -> tuple[str, ...]:
+    """Return the mandatory release chain for the packaged edition."""
+    if edition.lower() == "enterprise":
+        return tuple(scripts)
+    return tuple(name for name in scripts if name not in ENTERPRISE_ONLY_MIGRATION_SCRIPTS)
+V410_MODEL_TABLES = (
+    "CX_MODEL_GATEWAY_CREDENTIALS", "CX_MODEL_REQUESTS", "CX_MODEL_PRICING",
+    "CX_MODEL_USAGE", "CX_WALLBOARD_DEFINITIONS", "CX_MODEL_ROUTING_POLICIES",
+    "CX_MODEL_QUOTA_POLICIES", "CX_MODEL_QUOTA_RESERVATIONS",
+    "CX_MODEL_REPLAY_SNAPSHOTS", "CX_PROVIDER_INVOICE_BATCHES",
+    "CX_PROVIDER_INVOICE_LINES", "CX_MODEL_RECONCILIATIONS",
+    "CX_PROVIDER_INVOICE_CORRECTIONS",
+    "CX_MODEL_ALLOCATION_RULES", "CX_MODEL_ALLOCATIONS",
+    "CX_MODEL_EVIDENCE_ADAPTERS", "CX_MODEL_EVIDENCE_BATCHES",
+    "CX_WALLBOARD_DEF_VERSIONS", "CX_WALLBOARD_PUBLICATIONS",
+    "CX_EMBEDDING_ACCESS_GRANTS",
+)
+V411_RUNTIME_TABLES = (
+    "CX_RUNTIME_ISOLATION_CONTRACTS", "CX_DB4A2A_DISPATCHES",
+    "CX_RUNTIME_HOST_PROFILES", "CX_RUNTIME_UID_LEASES",
+)
+V411_RUNTIME_REQUIRED_COLUMNS = {
+    "CX_RUNTIME_EXECUTIONS": frozenset({
+        "EXECUTION_ID", "ISOLATION_LEVEL", "ISOLATION_EVIDENCE_JSON",
+        "ISOLATION_EVIDENCE_REF", "ISOLATION_ADMITTED_AT",
+    }),
+    "CX_RUNTIME_ISOLATION_CONTRACTS": frozenset({
+        "CONTRACT_ID", "AGENT_ID", "INSTANCE_ID", "ISOLATION_LEVEL", "ENFORCEMENT_MODE",
+        "RUNTIME_ADAPTER", "RUNTIME_IDENTITY", "BOUNDARIES_JSON", "POLICY_DIGEST",
+        "ROOTFS_DIGEST", "EVIDENCE_REF", "STATUS", "VERSION",
+    }),
+    "CX_DB4A2A_DISPATCHES": frozenset({
+        "DISPATCH_ID", "TASK_ID", "SENDER_PRINCIPAL_ID", "RECEIVER_AGENT_ID", "CONTEXT_REF",
+        "SNAPSHOT_DIGEST", "EXPECTED_VERSION", "SCOPE_REF", "SOURCE_BRANCH", "BRANCH_POLICY",
+        "TRANSPORT", "STATUS", "CHILD_BRANCH_ID",
+    }),
+    "CX_RUNTIME_HOST_PROFILES": frozenset({
+        "NODE_ID", "HOST_MANAGER_VERSION", "BOOTSTRAP_STATE", "ROOT_REMOTE_LOGIN",
+        "RECOVERY_CHANNEL", "UID_MIN", "UID_MAX", "PREFLIGHT_DIGEST",
+    }),
+    "CX_RUNTIME_UID_LEASES": frozenset({
+        "LEASE_ID", "NODE_ID", "AGENT_ID", "INSTANCE_ID", "RUNTIME_UID",
+        "RUNTIME_GID", "STATUS", "CREATED_BY", "REASON",
+    }),
+}
+V452_TASK_CONTINUITY_TABLES = (
+    "CX_TASK_CONTINUITY_LINKS", "CX_TASK_CONTINUITY_ATTEMPTS", "CX_TASK_CONTINUITY_LEASES",
+    "CX_TASK_CONTINUITY_CONTEXT", "CX_TASK_CONTINUITY_TRANSITIONS", "CX_TASK_CONTINUITY_LEGACY",
+)
+V452_TASK_CONTINUITY_REQUIRED_COLUMNS = {
+    "CX_TASK_CONTINUITY_LINKS": frozenset({"CONTINUITY_ID", "CANONICAL_TASK_ID", "LINK_KIND", "LINK_ID", "ACTOR_ID", "SECURITY_DOMAIN_ID", "AUTHORIZATION_VERSION", "CAPABILITY_VERSION", "EFFECT_CLASS", "IDEMPOTENCY_KEY", "REQUEST_DIGEST", "INPUT_DIGEST", "STATUS", "CREATED_AT", "UPDATED_AT"}),
+    "CX_TASK_CONTINUITY_ATTEMPTS": frozenset({"ATTEMPT_ID", "CONTINUITY_ID", "ATTEMPT_NO", "FENCING_TOKEN", "STATUS", "BUSINESS_KEY", "REQUEST_DIGEST", "LEASE_EXPIRES_AT", "STARTED_AT"}),
+    "CX_TASK_CONTINUITY_LEASES": frozenset({"CONTINUITY_ID", "LEASE_OWNER", "FENCING_TOKEN", "LEASE_EXPIRES_AT", "STATUS", "UPDATED_AT"}),
+    "CX_TASK_CONTINUITY_CONTEXT": frozenset({"CONTINUITY_ID", "SOURCE_REVISION_ID", "SOURCE_DIGEST", "SECURITY_DOMAIN_ID", "AUTHORIZATION_VERSION", "SUMMARY_POLICY", "CREATED_AT"}),
+    "CX_TASK_CONTINUITY_TRANSITIONS": frozenset({"TRANSITION_ID", "CONTINUITY_ID", "TO_STATUS", "ACTOR_ID", "REASON", "REQUEST_DIGEST", "CREATED_AT"}),
+    "CX_TASK_CONTINUITY_LEGACY": frozenset({"DISPATCH_ID", "TASK_ID", "MATCHED_TASK_ID", "CLASSIFICATION", "REASON", "CREATED_AT"}),
+}
+V448_PLATFORM_AGENT_ISOLATION_TABLES = (
+    "CX_PLATFORM_COMMANDS", "CX_PLATFORM_COMMAND_EXECUTORS",
+    "CX_PLATFORM_MAINTENANCE_TASKS", "CX_PLATFORM_MAINTENANCE_ATTEMPTS",
+    "CX_PLATFORM_SAFE_AUTONOMY_POLICIES", "CX_PLATFORM_KNOWLEDGE",
+    "CX_PLATFORM_KNOWLEDGE_CHUNKS", "CX_PLATFORM_KNOWLEDGE_GRANTS",
+    "CX_DATABASE_ISOLATION_INVENTORY",
+)
+V448_PLATFORM_AGENT_ISOLATION_REQUIRED_COLUMNS = {
+    "CX_PLATFORM_COMMANDS": frozenset({
+        "COMMAND_KEY", "VERSION", "STATUS", "RISK_LEVEL", "EXECUTION_MODE",
+        "PARAMETER_SCHEMA", "EXAMPLE_TEXT", "LOCALIZED_METADATA",
+        "APPROVAL_POLICY", "EXPIRY_SECONDS", "CONTENT_DIGEST",
+    }),
+    "CX_PLATFORM_COMMAND_EXECUTORS": frozenset({
+        "COMMAND_KEY", "COMMAND_VERSION", "EXECUTOR_KEY", "STATE",
+        "EXPECTED_DIGEST", "RATE_LIMIT_PER_MINUTE", "FAILURE_BUDGET",
+    }),
+    "CX_PLATFORM_MAINTENANCE_TASKS": frozenset({
+        "TASK_ID", "COMMAND_ID", "STATUS", "RISK_LEVEL", "AUTONOMOUS",
+        "IDEMPOTENCY_KEY", "LEASE_OWNER", "LEASE_EXPIRES_AT", "FENCING_TOKEN",
+        "POSTFLIGHT_JSON", "EVIDENCE_JSON", "GRAPH_RUN_ID",
+    }),
+    "CX_PLATFORM_MAINTENANCE_ATTEMPTS": frozenset({
+        "ATTEMPT_ID", "TASK_ID", "ATTEMPT_NO", "STATUS", "FENCING_TOKEN",
+        "OUTPUT_JSON", "FAILURE_REASON",
+    }),
+    "CX_PLATFORM_SAFE_AUTONOMY_POLICIES": frozenset({
+        "POLICY_ID", "STATE", "ALLOWED_COMMAND_JSON", "RATE_LIMIT_PER_MINUTE",
+        "MAX_CONCURRENCY", "FAILURE_BUDGET", "VERSION", "REASON",
+    }),
+    "CX_PLATFORM_KNOWLEDGE": frozenset({
+        "KNOWLEDGE_KEY", "VERSION", "AUDIENCE", "SCOPE_TYPE",
+        "SECURITY_DOMAIN_ID", "OWNER_PRINCIPAL_ID", "CLASSIFICATION",
+        "CONTENT_JSON", "CONTENT_DIGEST", "SIGNATURE", "SIGNATURE_STATUS",
+        "STATUS", "VALID_FROM", "VALID_UNTIL",
+    }),
+    "CX_PLATFORM_KNOWLEDGE_CHUNKS": frozenset({
+        "KNOWLEDGE_ID", "CHUNK_NO", "CHUNK_TEXT", "CHUNK_DIGEST",
+        "AUDIENCE", "SCOPE_TYPE", "SECURITY_DOMAIN_ID",
+        "OWNER_PRINCIPAL_ID", "CLASSIFICATION", "STATUS",
+    }),
+    "CX_PLATFORM_KNOWLEDGE_GRANTS": frozenset({
+        "KNOWLEDGE_ID", "PRINCIPAL_ID", "SECURITY_DOMAIN_ID",
+        "GRANT_SCOPE", "STATUS", "VALID_FROM", "VALID_UNTIL", "GRANTED_BY",
+    }),
+    "CX_DATABASE_ISOLATION_INVENTORY": frozenset({
+        "OBJECT_TYPE", "OBJECT_NAME", "SCOPE_KEYS_JSON", "HUMAN_PATH",
+        "AGENT_PATH", "SHARING_MODEL", "DERIVED_INHERITANCE", "MOVE_POLICY",
+        "ORACLE_ENFORCEMENT", "PG_ENFORCEMENT", "YASHAN_ENFORCEMENT",
+        "VERIFICATION_REF", "STATUS", "VERSION",
+    }),
+}
+V446_IDENTITY_PORTAL_GRAPH_TABLES = (
+    "CX_HUMAN_PROFILES", "CX_REG_FIELD_POLICIES", "CX_IDENTITY_PLATFORM_POLICIES",
+    "CX_HUMAN_REG_TOKENS", "CX_IDENTITY_PROVIDERS", "CX_EXTERNAL_ID_BINDINGS",
+    "CX_EXT_LOGIN_TXNS", "CX_PORTAL_CONN_POLICIES", "CX_PORTAL_CONNECTIONS",
+    "CX_PORTAL_PAGE_LEASES", "CX_GRAPH_CAP_POSTURE",
+)
+V446_IDENTITY_PORTAL_GRAPH_REQUIRED_COLUMNS = {
+    "CX_HUMAN_PROFILES": frozenset({"PRINCIPAL_ID", "DISPLAY_NAME", "REMEDIATION_STATE", "VERSION"}),
+    "CX_REG_FIELD_POLICIES": frozenset({"POLICY_ID", "FIELD_KEY", "REGISTRATION_CONTEXT", "FIELD_STATE", "VERSION"}),
+    "CX_IDENTITY_PLATFORM_POLICIES": frozenset({"POLICY_KEY", "POLICY_VALUE", "VERSION", "REASON"}),
+    "CX_HUMAN_REG_TOKENS": frozenset({"TOKEN_ID", "TOKEN_DIGEST", "PURPOSE", "EXPIRES_AT", "USED_COUNT"}),
+    "CX_IDENTITY_PROVIDERS": frozenset({"PROVIDER_ID", "PROVIDER_KEY", "ADAPTER_TYPE", "CAPABILITY_STATUS", "STATUS"}),
+    "CX_EXTERNAL_ID_BINDINGS": frozenset({"BINDING_ID", "PRINCIPAL_ID", "PROVIDER_ID", "PROVIDER_SUBJECT", "STATUS"}),
+    "CX_EXT_LOGIN_TXNS": frozenset({"TRANSACTION_ID", "TRANSACTION_DIGEST", "STATE_DIGEST", "NONCE_DIGEST", "EXPIRES_AT", "STATUS"}),
+    "CX_PORTAL_CONN_POLICIES": frozenset({"PRINCIPAL_ID", "MAX_CONNECTIONS", "VERSION"}),
+    "CX_PORTAL_CONNECTIONS": frozenset({"CONNECTION_ID", "PRINCIPAL_ID", "SESSION_DIGEST", "FENCING_TOKEN", "LEASE_EXPIRES_AT"}),
+    "CX_PORTAL_PAGE_LEASES": frozenset({"LEASE_ID", "CONNECTION_ID", "SESSION_DIGEST", "PAGE_INSTANCE_DIGEST", "FENCING_TOKEN"}),
+    "CX_GRAPH_CAP_POSTURE": frozenset({"CAPABILITY_KEY", "POSTURE", "EDITION_SCOPE"}),
+}
+V445_GRAPH_RUN_REQUIRED_COLUMNS = {
+    "GRAPH_RUNS": frozenset({
+        "DEFINITION_DIGEST", "PLAN_DIGEST", "COMPATIBILITY_LEVEL",
+        "STATE_SCHEMA_VERSION", "BUDGET_SCHEMA_VERSION",
+    }),
+}
+V444_AGENT_POOL_TABLES = (
+    "CX_PORTAL_LLM_POLICIES", "CX_PORTAL_LLM_ALLOWLIST", "CX_PLATFORM_ADMIN_COMMANDS",
+    "CX_MANAGED_NODES", "CX_SHARED_STORAGE_PROFILES", "CX_EXTERNAL_DB_ENDPOINTS",
+    "CX_AGENT_POOL_NODE_ONBOARDINGS",
+)
+V444_AGENT_POOL_REQUIRED_COLUMNS = {
+    "CX_PORTAL_LLM_POLICIES": frozenset({"POLICY_ID", "DEFAULT_PROFILE_ID", "VERSION"}),
+    "CX_PORTAL_LLM_ALLOWLIST": frozenset({"POLICY_ID", "PROFILE_ID", "STATUS"}),
+    "CX_PLATFORM_ADMIN_COMMANDS": frozenset({"COMMAND_ID", "COMMAND_TYPE", "STATUS", "EXPIRES_AT", "REASON"}),
+    "CX_MANAGED_NODES": frozenset({"NODE_ID", "NODE_KEY", "HOST_REFERENCE", "TRUST_MODE", "AGENT_INFO_PATH", "VALIDATION_STATE"}),
+    "CX_SHARED_STORAGE_PROFILES": frozenset({"STORAGE_ID", "STORAGE_KEY", "BACKEND_KIND", "LOCATION_REF", "VALIDATION_STATE"}),
+    "CX_MANAGED_NODE_STORAGE_BINDINGS": frozenset({"BINDING_ID", "NODE_ID", "STORAGE_ID", "MOUNT_REFERENCE", "ROLE_SCOPE", "STATUS", "REASON"}),
+    "CX_EXTERNAL_DB_ENDPOINTS": frozenset({"ENDPOINT_ID", "ENDPOINT_KEY", "HOST_REFERENCE", "PORT", "TLS_REQUIRED", "STATUS"}),
+    "CX_AGENT_POOL_NODE_ONBOARDINGS": frozenset({"ONBOARDING_ID", "NODE_ID", "INTEGRATION_KIND", "TOKEN_DIGEST", "STATUS", "EXPIRES_AT", "LAST_HEARTBEAT_AT"}),
+}
+V436_NATIVE_AGENT_TABLES = (
+    "CX_NATIVE_BOOTSTRAP", "CX_AGENT_TEMPLATES", "CX_NATIVE_MANIFESTS", "CX_NATIVE_AGENTS",
+    "CX_LLM_PROVIDER_PROFILES", "CX_DEPLOYMENT_TARGETS",
+    "CX_NATIVE_PROVISION_REQUESTS", "CX_RUNTIME_WORKERS",
+    "CX_RUNTIME_EXECUTIONS", "CX_EXTERNAL_AGENT_POLICY",
+    "CX_EXTERNAL_AGENT_POLICY_HISTORY",
+)
+V436_NATIVE_AGENT_REQUIRED_COLUMNS = {
+    "CX_NATIVE_BOOTSTRAP": frozenset({"BOOTSTRAP_KEY", "BOOTSTRAP_VERSION", "STATUS"}),
+    "CX_AGENT_TEMPLATES": frozenset({"TEMPLATE_ID", "TEMPLATE_KEY", "CONTENT_JSON", "CONTENT_DIGEST", "STATUS"}),
+    "CX_NATIVE_MANIFESTS": frozenset({"MANIFEST_ID", "MANIFEST_KEY", "VERSION", "CONTENT_DIGEST", "SIGNATURE", "SIGNATURE_STATUS", "STATUS"}),
+    "CX_NATIVE_AGENTS": frozenset({"AGENT_ID", "SOURCE", "AGENT_KIND", "STATUS", "ACTIVATION_STATE", "DEPLOYMENT_TARGET_ID"}),
+    "CX_LLM_PROVIDER_PROFILES": frozenset({"PROFILE_ID", "PROFILE_KEY", "PROVIDER_URL", "MODEL_ID", "API_KEY_CIPHER", "STATUS"}),
+    "CX_DEPLOYMENT_TARGETS": frozenset({"TARGET_ID", "TARGET_KEY", "TARGET_TYPE", "CONFIG_JSON", "STATUS"}),
+    "CX_NATIVE_PROVISION_REQUESTS": frozenset({"REQUEST_ID", "APPLICANT_PRINCIPAL_ID", "OWNER_PRINCIPAL_ID", "STATUS", "REASON"}),
+    "CX_RUNTIME_WORKERS": frozenset({"WORKER_ID", "NODE_ID", "STATUS", "FENCING_TOKEN"}),
+    "CX_RUNTIME_EXECUTIONS": frozenset({"EXECUTION_ID", "AGENT_ID", "STATUS", "INPUT_JSON", "FENCING_TOKEN"}),
+    "CX_EXTERNAL_AGENT_POLICY": frozenset({"POLICY_KEY", "STATE", "VERSION", "REASON"}),
+    "CX_EXTERNAL_AGENT_POLICY_HISTORY": frozenset({"HISTORY_ID", "POLICY_KEY", "FROM_STATE", "TO_STATE", "RESULT_VERSION"}),
+}
+V437_BOOTSTRAP_TABLES = (
+    "CX_DEPLOYMENT_RUNS", "CX_DEPLOYMENT_STEPS", "CX_DEPLOYMENT_EVIDENCE",
+    "CX_DEPLOYMENT_LEASES", "CX_EMBEDDING_PROFILES", "CX_EMBEDDING_CONTRACTS",
+    "CX_EMBEDDING_SPACES", "CX_EMBEDDING_BINDINGS", "CX_EMBEDDING_PROBES",
+    "CX_EMBEDDING_JOBS", "CX_EMBEDDING_HISTORY",
+)
+V437_BOOTSTRAP_REQUIRED_COLUMNS = {
+    "CX_DEPLOYMENT_RUNS": frozenset({"RUN_ID", "RUN_MODE", "STATUS", "READINESS_JSON", "PLAN_DIGEST"}),
+    "CX_DEPLOYMENT_STEPS": frozenset({"STEP_ID", "RUN_ID", "STEP_KEY", "STATUS", "ACTION_DIGEST"}),
+    "CX_DEPLOYMENT_EVIDENCE": frozenset({"EVIDENCE_ID", "RUN_ID", "EVIDENCE_TYPE", "PAYLOAD_DIGEST"}),
+    "CX_DEPLOYMENT_LEASES": frozenset({"LEASE_KEY", "RUN_ID", "FENCING_TOKEN", "LEASE_EXPIRES_AT"}),
+    "CX_EMBEDDING_PROFILES": frozenset({"PROFILE_ID", "PROFILE_KEY", "MODEL_ID", "MODEL_FINGERPRINT", "EXECUTION_MODE", "VERSION"}),
+    "CX_EMBEDDING_CONTRACTS": frozenset({"CONTRACT_ID", "PROFILE_ID", "CONTRACT_VERSION", "DIMENSION", "CONTRACT_DIGEST"}),
+    "CX_EMBEDDING_SPACES": frozenset({"SPACE_ID", "SPACE_KEY", "STATUS", "VALIDATION_STATE", "WRITE_ENABLED"}),
+    "CX_EMBEDDING_BINDINGS": frozenset({"BINDING_ID", "BINDING_SCOPE", "BINDING_SUBJECT_ID", "VERSION"}),
+    "CX_EMBEDDING_PROBES": frozenset({"PROBE_ID", "PROFILE_ID", "PROBE_SCOPE", "STATUS"}),
+    "CX_EMBEDDING_JOBS": frozenset({"JOB_ID", "JOB_KIND", "STATUS", "IDEMPOTENCY_KEY", "FENCING_TOKEN"}),
+    "CX_EMBEDDING_HISTORY": frozenset({"HISTORY_ID", "OBJECT_TYPE", "OBJECT_ID", "ACTION", "ACTOR"}),
+    "ENTITY_EMBEDDINGS": frozenset({"EMBEDDING_SPACE_ID", "EMBEDDING_PROFILE_ID", "EMBEDDING_CONTRACT_ID", "CONTENT_DIGEST", "SOURCE_MODE", "VALIDATION_STATUS"}),
+}
+V440_SDD_TABLES = (
+    "SPEC_VERSIONS", "CX_SDD_CHANGES", "CX_SDD_SOURCE_SNAPSHOTS", "CX_SDD_REVISIONS",
+    "CX_SDD_CLAUSES", "CX_SDD_UNRESOLVED_FRAGMENTS", "CX_SDD_TASKS", "CX_SDD_RESOURCE_LEASES",
+    "CX_SDD_RUNS", "CX_SDD_RUN_NODES", "CX_SDD_EVIDENCE", "CX_SDD_REVIEWS", "CX_SDD_GATES",
+    "CX_SDD_SCM_CONNECTIONS", "CX_SDD_ARTIFACTS",
+)
+V440_SDD_REQUIRED_COLUMNS = {
+    "SPEC_VERSIONS": frozenset({"VERSION_ID", "SPEC_ID", "VERSION_NUMBER", "DIFF_JSON"}),
+    "CX_SDD_CHANGES": frozenset({"CHANGE_ID", "TITLE", "PROFILE_KEY", "CURRENT_REVISION_ID", "STATUS"}),
+    "CX_SDD_REVISIONS": frozenset({"REVISION_ID", "CHANGE_ID", "REVISION_NO", "REVISION_STATE", "CONTENT_DIGEST", "EXPECTED_VERSION"}),
+    "CX_SDD_CLAUSES": frozenset({"CLAUSE_ID", "REVISION_ID", "CLAUSE_KIND", "STRUCTURED_JSON", "EXPECTED_VERSION"}),
+    "CX_SDD_UNRESOLVED_FRAGMENTS": frozenset({"FRAGMENT_ID", "REVISION_ID", "FRAGMENT_KIND", "CONTENT_DIGEST", "STATUS"}),
+    "CX_SDD_TASKS": frozenset({"TASK_ID", "REVISION_ID", "ROLE_KEY", "RISK_LEVEL", "READ_SET_JSON", "WRITE_SET_JSON"}),
+    "CX_SDD_RESOURCE_LEASES": frozenset({"LEASE_ID", "TASK_ID", "RESOURCE_REF", "FENCING_TOKEN", "LEASE_EXPIRES_AT"}),
+    "CX_SDD_RUNS": frozenset({"RUN_ID", "REVISION_ID", "STATUS", "BUDGET_JSON"}),
+    "CX_SDD_RUN_NODES": frozenset({"RUN_NODE_ID", "RUN_ID", "NODE_KEY", "READ_SET_JSON", "WRITE_SET_JSON"}),
+    "CX_SDD_EVIDENCE": frozenset({"EVIDENCE_ID", "REVISION_ID", "EVIDENCE_TYPE", "ARTIFACT_DIGEST", "INDEPENDENT_FLAG", "STATUS"}),
+    "CX_SDD_REVIEWS": frozenset({"REVIEW_ID", "REVISION_ID", "REVIEW_KIND", "STATUS"}),
+    "CX_SDD_GATES": frozenset({"GATE_ID", "RUN_ID", "RISK_LEVEL", "STATUS"}),
+    "CX_SDD_SCM_CONNECTIONS": frozenset({"CONNECTION_ID", "ADAPTER_KIND", "REPOSITORY_REF", "CREDENTIAL_REFERENCE"}),
+    "CX_SDD_ARTIFACTS": frozenset({"ARTIFACT_ID", "REFERENCE_URI", "CONTENT_DIGEST", "STATUS"}),
+}
+V441_ADMIN_HA_TABLES = (
+    "CX_ADMIN_AGENT_GROUPS", "CX_ADMIN_AGENT_MEMBERS", "CX_ADMIN_ENROLLMENTS",
+    "CX_ADMIN_QUORUM_SNAPSHOTS", "CX_ADMIN_LEADER_EVIDENCE", "CX_MANAGEMENT_ARTIFACTS",
+    "CX_MANAGEMENT_ARTIFACT_RECEIPTS", "CX_UPGRADE_PLANS", "CX_UPGRADE_NODES",
+    "CX_SKILL_DISTRIBUTION", "CX_AGENT_CONTAINMENT_COMMANDS", "CX_WEB_SESSION_POLICIES",
+    "CX_WEB_SESSION_POLICY_HISTORY", "CX_API_CURSORS", "CX_UPGRADE_APPROVALS",
+)
+V441_ADMIN_HA_REQUIRED_COLUMNS = {
+    "CX_ADMIN_AGENT_GROUPS": frozenset({"GROUP_ID", "GROUP_KEY", "CURRENT_TERM", "FENCING_TOKEN", "CONFIGURATION_STATE"}),
+    "CX_ADMIN_AGENT_MEMBERS": frozenset({"MEMBER_ID", "GROUP_ID", "AGENT_ID", "ADMISSION_PATH", "VOTING_ENABLED", "WEIGHT"}),
+    "CX_ADMIN_ENROLLMENTS": frozenset({"ENROLLMENT_ID", "ADMISSION_PATH", "PUBLIC_KEY_DIGEST", "PACKAGE_DIGEST", "STATUS", "REQUESTED_BY"}),
+    "CX_ADMIN_QUORUM_SNAPSHOTS": frozenset({"SNAPSHOT_ID", "GROUP_ID", "TERM", "MEMBERS_JSON", "TOTAL_WEIGHT"}),
+    "CX_ADMIN_LEADER_EVIDENCE": frozenset({"EVIDENCE_ID", "GROUP_ID", "NEW_TERM", "NEW_FENCING_TOKEN", "EVENT_TYPE"}),
+    "CX_MANAGEMENT_ARTIFACTS": frozenset({"ARTIFACT_ID", "CONTENT_DIGEST", "SIGNATURE", "SECRET_FREE", "STORAGE_ADAPTER"}),
+    "CX_MANAGEMENT_ARTIFACT_RECEIPTS": frozenset({"RECEIPT_ID", "ARTIFACT_ID", "NODE_ID", "SIGNATURE_STATE", "AVAILABILITY_STATE"}),
+    "CX_UPGRADE_PLANS": frozenset({"UPGRADE_ID", "PACKAGE_VERSION", "PACKAGE_DIGEST", "SIGNATURE_STATE", "ROLLOUT_STATE"}),
+    "CX_UPGRADE_NODES": frozenset({"UPGRADE_NODE_ID", "UPGRADE_ID", "NODE_ID", "STATE", "SKILL_STATE", "HEALTH_STATE"}),
+    "CX_SKILL_DISTRIBUTION": frozenset({"DISTRIBUTION_ID", "UPGRADE_ID", "AGENT_ID", "SKILL_VERSION", "DRIFT_STATE"}),
+    "CX_AGENT_CONTAINMENT_COMMANDS": frozenset({"COMMAND_ID", "INSTANCE_ID", "REQUESTED_STATE", "CONTROL_GENERATION", "NONCE_DIGEST"}),
+    "CX_WEB_SESSION_POLICIES": frozenset({"POLICY_KEY", "IDLE_TIMEOUT_SECONDS", "ABSOLUTE_TIMEOUT_SECONDS", "VERSION"}),
+    "CX_WEB_SESSION_POLICY_HISTORY": frozenset({"HISTORY_ID", "POLICY_KEY", "VERSION", "CHANGED_BY"}),
+    "CX_API_CURSORS": frozenset({"CURSOR_ID", "PRINCIPAL_ID", "RESOURCE_KEY", "FILTER_DIGEST", "PAGE_SIZE"}),
+    "CX_UPGRADE_APPROVALS": frozenset({"APPROVAL_ID", "UPGRADE_ID", "APPROVAL_KIND", "PRINCIPAL_ID", "DECISION", "TERM", "FENCING_TOKEN", "REASON"}),
+}
+V442_GRAPH_OPERATIONS_TABLES = (
+    "CX_GRAPH_CAPABILITY_PROFILES", "CX_GRAPH_CAPABILITY_MATRIX",
+    "CX_GRAPH_CAPABILITY_HISTORY", "CX_EMBEDDING_ACTIVATION_EVIDENCE",
+    "CX_ADMIN_NODE_TARGETS", "CX_ADMIN_DEPLOYMENT_ATTEMPTS",
+)
+V442_GRAPH_OPERATIONS_REQUIRED_COLUMNS = {
+    "CX_CHANNELS": frozenset({"CHANNEL_ID", "PINNED", "UPDATED_AT"}),
+    "CX_GRAPH_CAPABILITY_PROFILES": frozenset({"PROFILE_KEY", "PROFILE_VERSION", "STATUS", "REASON"}),
+    "CX_GRAPH_CAPABILITY_MATRIX": frozenset({"PROFILE_KEY", "CAPABILITY_KEY", "STATE", "VERSION", "MANDATORY", "REASON"}),
+    "CX_GRAPH_CAPABILITY_HISTORY": frozenset({"HISTORY_ID", "PROFILE_KEY", "CAPABILITY_KEY", "FROM_STATE", "TO_STATE", "EXPECTED_VERSION", "REASON"}),
+    "CX_EMBEDDING_ACTIVATION_EVIDENCE": frozenset({"ACTIVATION_ID", "PROFILE_ID", "OBSERVED_DIMENSION", "RESPONSE_DIGEST", "ACTIVATION_STATUS", "MIGRATION_STATE"}),
+    "CX_ADMIN_NODE_TARGETS": frozenset({"TARGET_ID", "NODE_ID", "HOST_REFERENCE", "SSH_PORT", "OS_USER", "DEPLOYMENT_TARGET", "SSH_TRUST_MODE", "STATUS", "REASON"}),
+    "CX_ADMIN_DEPLOYMENT_ATTEMPTS": frozenset({"ATTEMPT_ID", "TARGET_ID", "ATTEMPT_DIGEST", "VERIFICATION_STATE", "REASON"}),
+}
+V443_SECURITY_DOMAIN_TABLES = (
+    "CX_DOMAIN_GOVERNANCE", "CX_DOMAIN_BINDINGS", "CX_DOMAIN_CONVERSION_DRAFTS", "CX_DOMAIN_DRAFT_MEMBERS",
+)
+V443_SECURITY_DOMAIN_REQUIRED_COLUMNS = {
+    "CX_DOMAIN_GOVERNANCE": frozenset({"SECURITY_DOMAIN_ID", "OWNER_PRINCIPAL_ID", "REASON", "UPDATED_BY"}),
+    "CX_DOMAIN_BINDINGS": frozenset({"BINDING_ID", "SECURITY_DOMAIN_ID", "BINDING_TYPE", "TARGET_ID", "STATUS", "REASON", "CREATED_BY"}),
+    "CX_DOMAIN_CONVERSION_DRAFTS": frozenset({"DRAFT_ID", "SOURCE_GROUP_ID", "PROPOSED_DOMAIN_ID", "SNAPSHOT_JSON", "STATUS", "OWNER_PRINCIPAL_ID", "REASON"}),
+    "CX_DOMAIN_DRAFT_MEMBERS": frozenset({"DRAFT_MEMBER_ID", "DRAFT_ID", "PRINCIPAL_ID", "PRINCIPAL_TYPE", "MEMBERSHIP_TIER", "DECISION"}),
+}
+
+V432_MEMORY_TABLES = (
+    "CX_MEMORY_FAMILIES", "CX_MEMORY_VERSIONS", "CX_MEMORY_REPRESENTATIONS",
+    "CX_MEMORY_RELATIONS", "CX_MEMORY_SNAPSHOTS", "CX_MEMORY_SNAPSHOT_MEMBERS",
+    "CX_MEMORY_POLICIES", "CX_MEMORY_JOBS", "CX_MEMORY_JOB_ITEMS",
+    "CX_MEMORY_USAGE_EVENTS", "CX_MEMORY_CANDIDATES", "CX_MEMORY_REVIEWS",
+    "CX_MEMORY_PROJECTION_OUTBOX",
+    "CX_MEMORY_VERSION_ARTIFACTS", "CX_MEMORY_INGESTION_FINDINGS", "CX_MEMORY_WORKER_RESULTS",
+)
+
+V432_MEMORY_REQUIRED_COLUMNS = {
+    "CX_MEMORY_FAMILIES": frozenset({"FAMILY_ID", "CURRENT_VERSION_ID", "LEGACY_ENTITY_ID", "ROW_VERSION"}),
+    "CX_MEMORY_VERSIONS": frozenset({"VERSION_ID", "FAMILY_ID", "VERSION_NUMBER", "CONTENT_DIGEST", "MEMORY_TYPE", "MEMORY_SCOPE", "LIFECYCLE_STATE"}),
+    "CX_MEMORY_REPRESENTATIONS": frozenset({"REPRESENTATION_ID", "VERSION_ID", "REPRESENTATION_TYPE", "CONTENT_DIGEST", "TOKEN_COUNT"}),
+    "CX_MEMORY_RELATIONS": frozenset({"RELATION_ID", "SOURCE_VERSION_ID", "TARGET_VERSION_ID", "RELATION_TYPE", "RELATION_STATE"}),
+    "CX_MEMORY_SNAPSHOTS": frozenset({"SNAPSHOT_ID", "RUN_ID", "SNAPSHOT_VERSION", "SNAPSHOT_DIGEST", "PRINCIPAL_ID", "PRINCIPAL_PERMISSION_VERSION", "AGENT_INSTANCE_ID", "AGENT_FENCING_TOKEN"}),
+    "CX_MEMORY_JOBS": frozenset({"JOB_ID", "JOB_TYPE", "STATUS", "FENCING_TOKEN"}),
+    "CX_MEMORY_CANDIDATES": frozenset({"CANDIDATE_ID", "CANDIDATE_TYPE", "STATUS", "POLICY_RESULT"}),
+    "CX_MEMORY_PROJECTION_OUTBOX": frozenset({"OUTBOX_ID", "AGGREGATE_ID", "EVENT_TYPE", "STATUS"}),
+    "CX_MEMORY_VERSION_ARTIFACTS": frozenset({"LINK_ID", "VERSION_ID", "ARTIFACT_ID", "RELATION_TYPE"}),
+    "CX_MEMORY_INGESTION_FINDINGS": frozenset({"FINDING_ID", "VERSION_ID", "FINDING_TYPE", "CONTENT_DIGEST", "STATUS"}),
+    "CX_MEMORY_WORKER_RESULTS": frozenset({"RESULT_ID", "JOB_ITEM_ID", "WORKER_ID", "FENCING_TOKEN", "VALIDATION_STATE"}),
+}
+
+V431_ORGANIZATION_TABLES = (
+    "CX_REPORTING_RELATIONSHIPS", "CX_ORGANIZATION_CLOSURE",
+    "CX_ORGANIZATION_VERSIONS", "CX_ORGANIZATION_UNIT_HISTORY",
+    "CX_ORGANIZATION_MEMBER_HISTORY", "CX_REPORTING_HISTORY",
+    "CX_ORG_CHANGESETS", "CX_ORG_CHANGE_OPERATIONS",
+    "CX_DIRECTORY_SYNC_BATCHES", "CX_DIRECTORY_SOURCE_RECORDS",
+    "CX_DIRECTORY_CONFLICTS", "CX_ORG_LIFECYCLE_CASES", "CX_ORG_DISPOSITIONS",
+)
+
+V431_ORGANIZATION_REQUIRED_COLUMNS = {
+    "CX_PRINCIPALS": frozenset({
+        "PRINCIPAL_ID", "PRINCIPAL_TYPE", "DISPLAY_NAME", "STATUS",
+    }),
+    "CX_REGISTRATION_REQUESTS": frozenset({
+        "REQUEST_ID", "USERNAME", "DISPLAY_NAME", "STATUS",
+    }),
+    "CX_ORGANIZATIONS": frozenset({
+        "ORGANIZATION_ID", "PARENT_ID", "ORGANIZATION_NAME", "ORGANIZATION_CODE",
+        "ORGANIZATION_TYPE", "IS_LEGAL_ENTITY", "SORT_ORDER", "VALID_FROM",
+        "VALID_UNTIL", "SOURCE_TYPE", "ROW_VERSION", "STATUS",
+    }),
+    "CX_ORGANIZATION_MEMBERS": frozenset({
+        "MEMBERSHIP_ID", "ORGANIZATION_ID", "PRINCIPAL_ID", "MEMBERSHIP_KIND",
+        "VALID_FROM", "VALID_UNTIL", "SOURCE_TYPE", "ROW_VERSION", "STATUS",
+    }),
+    "CX_REPORTING_RELATIONSHIPS": frozenset({
+        "RELATIONSHIP_ID", "PRINCIPAL_ID", "MANAGER_PRINCIPAL_ID",
+        "RELATIONSHIP_TYPE", "VALID_FROM", "VALID_UNTIL", "SOURCE_TYPE",
+        "ROW_VERSION", "STATUS",
+    }),
+    "CX_ORGANIZATION_CLOSURE": frozenset({"ANCESTOR_ID", "DESCENDANT_ID", "DEPTH"}),
+    "CX_ORGANIZATION_VERSIONS": frozenset({
+        "VERSION_ID", "VERSION_NUMBER", "CHANGE_SET_ID", "STATUS", "EFFECTIVE_AT",
+        "REASON", "CREATED_BY",
+    }),
+    "CX_ORGANIZATION_UNIT_HISTORY": frozenset({
+        "HISTORY_ID", "VERSION_ID", "ORGANIZATION_ID", "OPERATION", "FACT_JSON",
+        "FACT_DIGEST", "ACTOR_PRINCIPAL_ID", "REASON",
+    }),
+    "CX_ORGANIZATION_MEMBER_HISTORY": frozenset({
+        "HISTORY_ID", "VERSION_ID", "MEMBERSHIP_ID", "PRINCIPAL_ID",
+        "ORGANIZATION_ID", "OPERATION", "FACT_JSON", "FACT_DIGEST",
+    }),
+    "CX_REPORTING_HISTORY": frozenset({
+        "HISTORY_ID", "VERSION_ID", "RELATIONSHIP_ID", "PRINCIPAL_ID",
+        "MANAGER_PRINCIPAL_ID", "OPERATION", "FACT_JSON", "FACT_DIGEST",
+    }),
+    "CX_ORG_CHANGESETS": frozenset({
+        "CHANGE_SET_ID", "BASE_VERSION_ID", "AUTHOR_PRINCIPAL_ID", "STATUS",
+        "REASON", "RISK_LEVEL", "IDEMPOTENCY_KEY", "ROW_VERSION",
+    }),
+    "CX_ORG_CHANGE_OPERATIONS": frozenset({
+        "OPERATION_ID", "CHANGE_SET_ID", "SEQUENCE_NUMBER", "OPERATION_TYPE",
+        "TARGET_TYPE", "COMMAND_JSON", "AFTER_DIGEST", "STATUS",
+    }),
+    "CX_DIRECTORY_SYNC_BATCHES": frozenset({
+        "SYNC_BATCH_ID", "CONNECTOR_ID", "CONNECTOR_TYPE", "SOURCE_DIGEST",
+        "STATUS", "REQUESTED_BY", "CHANGE_SET_ID",
+    }),
+    "CX_DIRECTORY_SOURCE_RECORDS": frozenset({
+        "SOURCE_RECORD_ID", "SYNC_BATCH_ID", "CONNECTOR_ID", "EXTERNAL_OBJECT_ID",
+        "OBJECT_TYPE", "SOURCE_DIGEST", "NORMALIZED_JSON", "STATUS",
+    }),
+    "CX_DIRECTORY_CONFLICTS": frozenset({
+        "CONFLICT_ID", "SYNC_BATCH_ID", "OBJECT_TYPE", "FIELD_NAME",
+        "AUTHORITY_SOURCE", "RISK_LEVEL", "STATUS",
+    }),
+    "CX_ORG_LIFECYCLE_CASES": frozenset({
+        "LIFECYCLE_CASE_ID", "SUBJECT_TYPE", "SUBJECT_ID", "LIFECYCLE_TYPE",
+        "STATUS", "REASON", "ROW_VERSION", "CREATED_BY",
+    }),
+    "CX_ORG_DISPOSITIONS": frozenset({
+        "DISPOSITION_ID", "LIFECYCLE_CASE_ID", "CHANGE_SET_ID", "SUBJECT_TYPE",
+        "SUBJECT_ID", "DISPOSITION_TYPE", "STATUS", "REASON",
+    }),
+}
+
+V431_ENTRY_ACCESS_REQUIRED_COLUMNS = {
+    "CX_PRINCIPALS": frozenset({"PORTAL_ACCESS", "APP_ACCESS", "ORGANIZATION_REQUIRED"}),
+}
+
+V431_INDEX_CONTRACT = {
+    "IDX_CX_ORG_ACTIVE_PRIMARY": ("CX_ORGANIZATION_MEMBERS", True),
+    "IDX_CX_REPORTING_ACTIVE_DIRECT": ("CX_REPORTING_RELATIONSHIPS", True),
+    "IDX_CX_ORG_CLOSURE_DESC": ("CX_ORGANIZATION_CLOSURE", False),
+    "IDX_CX_ORG_CLOSURE_ANCESTOR": ("CX_ORGANIZATION_CLOSURE", False),
+    "IDX_CX_ORG_CHANGESET_STATE": ("CX_ORG_CHANGESETS", False),
+    "IDX_CX_DIRECTORY_CONFLICT": ("CX_DIRECTORY_CONFLICTS", False),
+}
+
+V43_BASE_TABLES = (
+    "CX_PRINCIPALS", "CX_HUMAN_IDENTITIES", "CX_REGISTRATION_REQUESTS", "CX_WEB_SESSIONS",
+    "CX_ROLE_TEMPLATES", "CX_USER_ROLES", "CX_USER_PERMISSION_OVERRIDES",
+    "CX_ORGANIZATIONS", "CX_ORGANIZATION_MEMBERS", "CX_RESPONSIBLE_GROUPS",
+    "CX_RESPONSIBLE_GROUP_MEMBERS", "CX_SECURITY_DOMAINS", "CX_DOMAIN_MEMBERS",
+    "CX_ENROLLMENT_GRANTS", "CX_ENROLLMENT_TOKENS", "CX_AGENT_RELATIONSHIPS",
+    "CX_AGENT_CREDENTIALS", "CX_AGENT_ACCESS_TOKENS", "CX_CHANNELS", "CX_CHANNEL_MEMBERS",
+    "CX_CHANNEL_MESSAGES", "CX_BARRIERS", "CX_BARRIER_ARRIVALS", "CX_ACTION_CARDS",
+    "CX_NOTIFICATIONS", "CX_SECURITY_EVENTS", "CX_BRIDGES", "CX_AGENT_INSTANCES",
+    "CX_AGENT_DELIVERIES", "CX_CHANNEL_MEMORY_CANDIDATES", "CX_BRIDGE_TRANSFERS",
+)
+V43_GOVERNANCE_TABLES = (
+    "CX_CHANNEL_THREADS", "CX_CHANNEL_THREAD_MEMBERS", "CX_RUNTIME_PROFILE_CHANGES",
+)
+V43_SECURITY_TABLES = (
+    "CX_MFA_FACTORS", "CX_MFA_RECOVERY_CODES", "CX_PASSWORD_RESET_TOKENS",
+    "CX_IDENTITY_LINK_AUDIT", "CX_DELEGATIONS", "CX_AGENT_QUOTAS",
+    "CX_AGENT_OWNERSHIP_HISTORY", "CX_AGENT_LEGACY_REVIEWS", "CX_AGENT_DERIVED_OBJECTS",
+    "CX_CHANNEL_DELETION_EVIDENCE", "CX_MEMORY_ARTIFACT_LINKS", "CX_BRIDGE_CONNECTORS",
+)
+V43_REQUIRED_TABLES = V43_BASE_TABLES + V43_GOVERNANCE_TABLES + V43_SECURITY_TABLES
+
+# These are the portable columns needed by the lifecycle APIs.  The contract
+# intentionally checks more than a table name: an old draft with the right
+# table names but missing fencing, ownership, or evidence fields is not an
+# applied migration.
+V43_BASE_REQUIRED_COLUMNS = {
+    "CX_PRINCIPALS": frozenset({"PRINCIPAL_ID", "PRINCIPAL_TYPE", "STATUS", "PERMISSION_VERSION"}),
+    "CX_HUMAN_IDENTITIES": frozenset({"IDENTITY_ID", "PRINCIPAL_ID", "IDENTITY_TYPE", "SUBJECT_KEY", "PASSWORD_HASH", "STATUS"}),
+    "CX_REGISTRATION_REQUESTS": frozenset({"REQUEST_ID", "USERNAME", "PASSWORD_HASH", "STATUS", "CREATED_AT"}),
+    "CX_WEB_SESSIONS": frozenset({"SESSION_DIGEST", "PRINCIPAL_ID", "CSRF_DIGEST", "EXPIRES_AT", "REVOKED_AT", "NODE_ID"}),
+    "CX_ROLE_TEMPLATES": frozenset({"ROLE_CODE", "PERMISSIONS_JSON", "DATA_SCOPES_JSON", "MANAGED"}),
+    "CX_USER_ROLES": frozenset({"USER_ROLE_ID", "PRINCIPAL_ID", "ROLE_CODE", "STATUS"}),
+    "CX_USER_PERMISSION_OVERRIDES": frozenset({"OVERRIDE_ID", "PRINCIPAL_ID", "RESOURCE_ACTION", "EFFECT", "DATA_SCOPE", "REASON"}),
+    "CX_ORGANIZATIONS": frozenset({"ORGANIZATION_ID", "PARENT_ID", "STATUS"}),
+    "CX_ORGANIZATION_MEMBERS": frozenset({"MEMBERSHIP_ID", "ORGANIZATION_ID", "PRINCIPAL_ID", "MANAGER_PRINCIPAL_ID", "STATUS"}),
+    "CX_RESPONSIBLE_GROUPS": frozenset({"GROUP_ID", "SECURITY_DOMAIN_ID", "PARENT_GROUP_ID", "STATUS"}),
+    "CX_RESPONSIBLE_GROUP_MEMBERS": frozenset({"GROUP_ID", "PRINCIPAL_ID", "MEMBER_ROLE", "STATUS"}),
+    "CX_SECURITY_DOMAINS": frozenset({"SECURITY_DOMAIN_ID", "DOMAIN_NAME", "CLASSIFICATION", "STATUS"}),
+    "CX_DOMAIN_MEMBERS": frozenset({"MEMBERSHIP_ID", "SECURITY_DOMAIN_ID", "PRINCIPAL_ID", "MEMBERSHIP_TIER", "STATUS"}),
+    "CX_ENROLLMENT_GRANTS": frozenset({"GRANT_ID", "SPONSOR_PRINCIPAL_ID", "OWNER_PRINCIPAL_ID", "RESPONSIBLE_GROUP_ID", "ENVIRONMENT", "RUNTIME", "POLICY_SNAPSHOT", "STATUS", "EXPIRES_AT", "MAX_USES", "USED_COUNT"}),
+    "CX_ENROLLMENT_TOKENS": frozenset({"TOKEN_ID", "GRANT_ID", "TOKEN_DIGEST", "EXPIRES_AT", "CONSUMED_AT"}),
+    "CX_AGENT_RELATIONSHIPS": frozenset({"RELATIONSHIP_ID", "AGENT_ID", "PRINCIPAL_ID", "RELATIONSHIP_ROLE", "RESPONSIBLE_GROUP_ID", "STATUS"}),
+    "CX_AGENT_CREDENTIALS": frozenset({"CREDENTIAL_ID", "AGENT_ID", "CREDENTIAL_TYPE", "STATUS"}),
+    "CX_AGENT_ACCESS_TOKENS": frozenset({"TOKEN_DIGEST", "AGENT_ID", "INSTANCE_ID", "FENCING_TOKEN", "EXPIRES_AT", "REVOKED_AT"}),
+    "CX_CHANNELS": frozenset({"CHANNEL_ID", "CHANNEL_NAME", "SECURITY_DOMAIN_ID", "CLASSIFICATION", "CHANNEL_TYPE", "STATUS", "RETENTION_UNTIL", "LEGAL_HOLD"}),
+    "CX_CHANNEL_MEMBERS": frozenset({"MEMBER_ID", "CHANNEL_ID", "PRINCIPAL_ID", "MEMBER_ROLE", "STATUS"}),
+    "CX_CHANNEL_MESSAGES": frozenset({"MESSAGE_ID", "CHANNEL_ID", "PRINCIPAL_ID", "BODY_TEXT", "CREATED_AT"}),
+    "CX_BARRIERS": frozenset({"BARRIER_ID", "NODE_KEY", "POLICY_JSON", "PARTICIPANT_SNAPSHOT", "STATUS", "CREATED_BY"}),
+    "CX_BARRIER_ARRIVALS": frozenset({"ARRIVAL_ID", "BARRIER_ID", "PRINCIPAL_ID", "PARTICIPANT_ROLE", "REPORT_DIGEST", "REPORT_JSON", "IDEMPOTENCY_KEY"}),
+    "CX_ACTION_CARDS": frozenset({"ACTION_ID", "CHANNEL_ID", "PROPOSED_BY", "ACTION_TYPE", "STATUS", "REASON", "IDEMPOTENCY_KEY"}),
+    "CX_NOTIFICATIONS": frozenset({"NOTIFICATION_ID", "PRINCIPAL_ID", "NOTIFICATION_TYPE", "DEDUPE_KEY", "PAYLOAD_JSON"}),
+    "CX_SECURITY_EVENTS": frozenset({"EVENT_ID", "PRINCIPAL_ID", "ACTION_NAME", "OUTCOME", "CREATED_AT"}),
+    "CX_BRIDGES": frozenset({"BRIDGE_ID", "SOURCE_DOMAIN_ID", "TARGET_DOMAIN_ID", "TRANSFER_MODE", "PURPOSE", "CLASSIFICATION", "RECIPIENT_SNAPSHOT", "STATUS"}),
+    "CX_AGENT_INSTANCES": frozenset({"INSTANCE_ID", "AGENT_ID", "CHANNEL_ID", "STATUS", "FENCING_TOKEN", "LAST_SEEN_AT", "LEASE_EXPIRES_AT"}),
+    "CX_AGENT_DELIVERIES": frozenset({"DELIVERY_ID", "AGENT_ID", "INSTANCE_ID", "IDEMPOTENCY_KEY", "STATUS", "CLAIM_TOKEN_DIGEST", "CLAIMED_AT", "FENCING_TOKEN"}),
+    "CX_CHANNEL_MEMORY_CANDIDATES": frozenset({"CANDIDATE_ID", "CHANNEL_ID", "SECURITY_DOMAIN_ID", "CONTENT_JSON", "CLASSIFICATION", "DESTINATION_SCOPE", "PROVENANCE_JSON", "STATUS"}),
+    "CX_BRIDGE_TRANSFERS": frozenset({"TRANSFER_ID", "BRIDGE_ID", "SOURCE_OBJECT_TYPE", "SOURCE_OBJECT_ID", "STATUS", "CREATED_BY", "IDEMPOTENCY_KEY", "SOURCE_CLASSIFICATION"}),
+}
+
+V43_GOVERNANCE_REQUIRED_COLUMNS = {
+    "CX_CHANNELS": frozenset({"LIFECYCLE_REASON", "DELETION_AFTER", "QUARANTINED_AT"}),
+    "CX_BRIDGES": frozenset({"APPROVAL_REASON", "POLICY_VERSION"}),
+    "CX_BRIDGE_TRANSFERS": frozenset({"IDEMPOTENCY_KEY", "SOURCE_CLASSIFICATION"}),
+    "CX_NOTIFICATIONS": frozenset({"NOTIFICATION_LEVEL", "ACKNOWLEDGED_BY", "ESCALATED_AT"}),
+    "CX_BARRIERS": frozenset({"RETRY_COUNT", "MAX_RETRIES", "LAST_RECOVERY_ACTION", "RECOVERY_REASON"}),
+    "CX_CHANNEL_THREADS": frozenset({"THREAD_ID", "CHANNEL_ID", "THREAD_TYPE", "CLASSIFICATION", "STATUS", "POLICY_JSON", "CREATED_BY"}),
+    "CX_CHANNEL_THREAD_MEMBERS": frozenset({"THREAD_MEMBER_ID", "THREAD_ID", "PRINCIPAL_ID", "MEMBER_ROLE", "STATUS", "VALID_UNTIL"}),
+    "CX_RUNTIME_PROFILE_CHANGES": frozenset({"CHANGE_ID", "REQUESTED_BY", "CURRENT_PROFILE", "TARGET_PROFILE", "IMPACT_JSON", "STATUS", "REASON"}),
+}
+
+V43_SECURITY_REQUIRED_COLUMNS = {
+    "CX_PRINCIPALS": frozenset({"MFA_REQUIRED"}),
+    "CX_HUMAN_IDENTITIES": frozenset({"FAILED_LOGIN_COUNT", "LOCKED_UNTIL", "USER_ID"}),
+    "CX_ENROLLMENT_GRANTS": frozenset({"AGENT_ID"}),
+    "CX_MFA_FACTORS": frozenset({"FACTOR_ID", "PRINCIPAL_ID", "FACTOR_TYPE", "STATUS"}),
+    "CX_MFA_RECOVERY_CODES": frozenset({"CODE_ID", "PRINCIPAL_ID", "CODE_DIGEST", "STATUS"}),
+    "CX_PASSWORD_RESET_TOKENS": frozenset({"TOKEN_ID", "PRINCIPAL_ID", "TOKEN_DIGEST", "PURPOSE", "EXPIRES_AT", "CONSUMED_AT"}),
+    "CX_IDENTITY_LINK_AUDIT": frozenset({"LINK_EVENT_ID", "PRINCIPAL_ID", "ACTOR_PRINCIPAL_ID", "PROVIDER", "SUBJECT_DIGEST", "REASON", "OUTCOME"}),
+    "CX_DELEGATIONS": frozenset({"DELEGATION_ID", "GRANTOR_PRINCIPAL_ID", "GRANTEE_PRINCIPAL_ID", "PERMISSIONS_JSON", "DATA_SCOPE", "REASON", "STATUS"}),
+    "CX_AGENT_QUOTAS": frozenset({"QUOTA_ID", "SCOPE_TYPE", "SCOPE_ID", "ENVIRONMENT", "MAX_AGENTS", "USED_AGENTS", "MAX_ACTIVE_INSTANCES", "USED_ACTIVE_INSTANCES", "STATUS"}),
+    "CX_AGENT_OWNERSHIP_HISTORY": frozenset({"HISTORY_ID", "AGENT_ID", "ACTOR_PRINCIPAL_ID", "CREDENTIAL_ROTATED", "GRANTS_REEVALUATED", "REASON"}),
+    "CX_AGENT_LEGACY_REVIEWS": frozenset({"REVIEW_ID", "AGENT_ID", "CLASSIFICATION", "EVIDENCE_JSON", "STATUS", "CLAIM_REASON"}),
+    "CX_AGENT_DERIVED_OBJECTS": frozenset({"DERIVED_OBJECT_ID", "AGENT_ID", "INSTANCE_ID", "OBJECT_TYPE", "OBJECT_ID", "STATUS", "REVOKED_AT"}),
+    "CX_CHANNEL_DELETION_EVIDENCE": frozenset({"EVIDENCE_ID", "CHANNEL_ID", "ACTOR_PRINCIPAL_ID", "FROM_STATUS", "TO_STATUS", "REFERENCE_COUNT", "REASON", "DETAIL_JSON"}),
+    "CX_MEMORY_ARTIFACT_LINKS": frozenset({"LINK_ID", "CANDIDATE_ID", "ARTIFACT_ID", "DESTINATION_SCOPE", "STATUS"}),
+    "CX_BRIDGE_CONNECTORS": frozenset({"CONNECTOR_ID", "BRIDGE_ID", "CONNECTOR_MODE", "ENDPOINT_REF", "METADATA_ONLY", "STATUS", "REASON"}),
+}
+
+V43_REQUIRED_COLUMNS = {
+    table: frozenset(columns)
+    for table, columns in {
+        **V43_BASE_REQUIRED_COLUMNS,
+        **V43_GOVERNANCE_REQUIRED_COLUMNS,
+        **V43_SECURITY_REQUIRED_COLUMNS,
+    }.items()
+}
+
+# These are the columns a short-lived early v4.3 draft could omit.  They may
+# be replayed by the identity step, but an unrelated partial table is never
+# silently adopted.
+V43_EARLY_ADDITIVE_COLUMNS = {
+    "CX_AGENT_INSTANCES": frozenset({"LEASE_EXPIRES_AT"}),
+    "CX_AGENT_ACCESS_TOKENS": frozenset({"FENCING_TOKEN"}),
+    "CX_BARRIERS": frozenset({"CREATED_BY"}),
+    "CX_AGENT_DELIVERIES": frozenset({"CLAIM_TOKEN_DIGEST", "CLAIMED_AT", "FENCING_TOKEN"}),
+}
+
+V43_INDEX_CONTRACT = {
+    "IDX_CX_PRINCIPAL_TYPE": ("CX_PRINCIPALS", False),
+    "IDX_CX_IDENTITY_PRINCIPAL": ("CX_HUMAN_IDENTITIES", False),
+    "IDX_CX_IDENTITY_USERNAME": ("CX_HUMAN_IDENTITIES", True),
+    "IDX_CX_REGISTRATION_STATUS": ("CX_REGISTRATION_REQUESTS", False),
+    "IDX_CX_SESSION_PRINCIPAL": ("CX_WEB_SESSIONS", False),
+    "IDX_CX_USER_ROLES": ("CX_USER_ROLES", False),
+    "IDX_CX_PERMISSION_OVERRIDE": ("CX_USER_PERMISSION_OVERRIDES", False),
+    "IDX_CX_ENROLLMENT_TOKEN_ACTIVE": ("CX_ENROLLMENT_TOKENS", False),
+    "IDX_CX_AGENT_PRIMARY_OWNER": ("CX_AGENT_RELATIONSHIPS", True),
+    "IDX_CX_AGENT_ACCESS_TOKEN": ("CX_AGENT_ACCESS_TOKENS", False),
+    "IDX_CX_CHANNEL_DOMAIN": ("CX_CHANNELS", False),
+    "IDX_CX_CHANNEL_MESSAGE_CURSOR": ("CX_CHANNEL_MESSAGES", False),
+    "IDX_CX_BARRIER_STATUS": ("CX_BARRIERS", False),
+    "IDX_CX_BARRIER_ARRIVAL_IDEMP": ("CX_BARRIER_ARRIVALS", True),
+    "IDX_CX_SECURITY_EVENT_TIME": ("CX_SECURITY_EVENTS", False),
+    "IDX_CX_AGENT_INSTANCE_SCOPE": ("CX_AGENT_INSTANCES", False),
+    "IDX_CX_DELIVERY_CLAIM": ("CX_AGENT_DELIVERIES", False),
+    "IDX_CX_DELIVERY_CLAIM_TOKEN": ("CX_AGENT_DELIVERIES", False),
+    "IDX_CX_BRIDGE_TRANSFER_IDEMP": ("CX_BRIDGE_TRANSFERS", True),
+    "IDX_CX_CHANNEL_THREAD_PARENT": ("CX_CHANNEL_THREADS", False),
+    "IDX_CX_CHANNEL_THREAD_MEMBER": ("CX_CHANNEL_THREAD_MEMBERS", False),
+    "IDX_CX_MFA_PRINCIPAL": ("CX_MFA_FACTORS", False),
+    "IDX_CX_RESET_ACTIVE": ("CX_PASSWORD_RESET_TOKENS", False),
+    "IDX_CX_AGENT_REVIEW_STATUS": ("CX_AGENT_LEGACY_REVIEWS", False),
+    "IDX_CX_DERIVED_AGENT": ("CX_AGENT_DERIVED_OBJECTS", False),
+    "IDX_CX_ENROLLMENT_AGENT": ("CX_ENROLLMENT_GRANTS", False),
+}
+
+V43_BASE_INDEXES = frozenset(name for name, (table, unique) in V43_INDEX_CONTRACT.items() if table in V43_BASE_TABLES)
+V43_GOVERNANCE_INDEXES = frozenset({"IDX_CX_BRIDGE_TRANSFER_IDEMP", "IDX_CX_CHANNEL_THREAD_PARENT", "IDX_CX_CHANNEL_THREAD_MEMBER"})
+V43_SECURITY_INDEXES = frozenset({"IDX_CX_MFA_PRINCIPAL", "IDX_CX_RESET_ACTIVE", "IDX_CX_AGENT_REVIEW_STATUS", "IDX_CX_DERIVED_AGENT", "IDX_CX_ENROLLMENT_AGENT"})
+
+V43_PG_RLS_TABLES = frozenset({
+    "CX_PRINCIPALS", "CX_HUMAN_IDENTITIES", "CX_REGISTRATION_REQUESTS", "CX_WEB_SESSIONS",
+    "CX_ROLE_TEMPLATES", "CX_USER_ROLES", "CX_USER_PERMISSION_OVERRIDES", "CX_ORGANIZATIONS",
+    "CX_ORGANIZATION_MEMBERS", "CX_SECURITY_DOMAINS", "CX_DOMAIN_MEMBERS", "CX_ENROLLMENT_GRANTS",
+    "CX_ENROLLMENT_TOKENS", "CX_AGENT_RELATIONSHIPS", "CX_AGENT_CREDENTIALS", "CX_AGENT_ACCESS_TOKENS",
+    "CX_CHANNELS", "CX_CHANNEL_MEMBERS", "CX_CHANNEL_MESSAGES", "CX_BARRIERS", "CX_BARRIER_ARRIVALS",
+    "CX_ACTION_CARDS", "CX_NOTIFICATIONS", "CX_SECURITY_EVENTS", "CX_BRIDGES",
+    "CX_CHANNEL_MEMORY_CANDIDATES", "CX_BRIDGE_TRANSFERS", "CX_AGENT_INSTANCES", "CX_AGENT_DELIVERIES",
+    "CX_CHANNEL_THREADS", "CX_CHANNEL_THREAD_MEMBERS", "CX_RUNTIME_PROFILE_CHANGES",
+    "CX_MFA_FACTORS", "CX_MFA_RECOVERY_CODES", "CX_PASSWORD_RESET_TOKENS", "CX_DELEGATIONS",
+    "CX_AGENT_LEGACY_REVIEWS", "CX_AGENT_DERIVED_OBJECTS",
+})
+
+V43_PG_RLS_POLICIES = frozenset({
+    "CX_PRINCIPALS_AGENT_SELF", "CX_AGENT_RELATIONSHIPS_SELF", "CX_AGENT_CREDENTIALS_SELF",
+    "CX_AGENT_ACCESS_TOKENS_SELF", "CX_AGENT_INSTANCES_SELF", "CX_AGENT_DELIVERIES_SELF",
+    "CX_CHANNELS_MEMBER", "CX_CHANNEL_MEMBERS_MEMBER", "CX_CHANNEL_MESSAGES_MEMBER",
+    "CX_CHANNEL_MESSAGES_AGENT_INSERT", "CX_BARRIERS_MEMBER", "CX_BARRIER_ARRIVALS_MEMBER",
+    "CX_BARRIER_ARRIVALS_AGENT_INSERT", "CX_ACTION_CARDS_MEMBER", "CX_ACTION_CARDS_AGENT_INSERT",
+    "CX_NOTIFICATIONS_SELF", "CX_SECURITY_EVENTS_SELF", "CX_SECURITY_EVENTS_AGENT_INSERT",
+    "CX_CHANNEL_MEMORY_CANDIDATES_MEMBER", "CX_CHANNEL_MEMORY_CANDIDATES_AGENT_INSERT",
+    "CX_CHANNEL_THREADS_MEMBER", "CX_CHANNEL_THREADS_AGENT_INSERT", "CX_CHANNEL_THREAD_MEMBERS_MEMBER",
+    "CX_CHANNEL_THREAD_MEMBERS_AGENT_INSERT", "CX_MFA_FACTOR_OWNER", "CX_MFA_RECOVERY_OWNER",
+    "CX_RESET_OWNER", "CX_DELEGATION_MEMBER", "CX_LEGACY_REVIEW_SCOPE", "CX_DERIVED_INSTANCE_SCOPE",
+})
+
+V43_PG_PERMISSION_MARKERS = (
+    "GRANT USAGE ON SCHEMA PUBLIC TO AI_AGENT_RUNTIME",
+    "REVOKE ALL ON FUNCTION PUBLIC.CX_AGENT_CHANNEL_MEMBER",
+    "GRANT EXECUTE ON FUNCTION PUBLIC.CX_AGENT_CHANNEL_MEMBER",
+    "REVOKE ALL ON TABLE PUBLIC.CX_CHANNEL_THREADS",
+    "GRANT SELECT, INSERT ON TABLE PUBLIC.CX_CHANNEL_THREADS",
+    "REVOKE UPDATE, DELETE ON TABLE PUBLIC.CX_CHANNEL_THREADS",
+)
+
+V43_NATIVE_PERMISSION_MARKERS = (
+    "GRANT CREATE SESSION TO AGENT_API",
+    "GRANT SELECT ON &&SCHEMA_OWNER..ENTITIES TO AGENT_API",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON",
+    "DEEP_SEC_SESSION_ROLE",
+    "CREATE TABLE",
+    "DROP ANY TABLE",
+)
+
+V43_PG_RUNTIME_TABLES = frozenset({
+    "CX_PRINCIPALS", "CX_HUMAN_IDENTITIES", "CX_AGENT_RELATIONSHIPS", "CX_AGENT_CREDENTIALS",
+    "CX_AGENT_ACCESS_TOKENS", "CX_AGENT_INSTANCES", "CX_AGENT_DELIVERIES", "CX_CHANNELS",
+    "CX_CHANNEL_MEMBERS", "CX_CHANNEL_MESSAGES", "CX_BARRIERS", "CX_BARRIER_ARRIVALS",
+    "CX_ACTION_CARDS", "CX_NOTIFICATIONS", "CX_SECURITY_EVENTS", "CX_CHANNEL_MEMORY_CANDIDATES",
+})
+V43_PG_THREAD_RUNTIME_TABLES = frozenset({"CX_CHANNEL_THREADS", "CX_CHANNEL_THREAD_MEMBERS"})
+
+
+def _strip_sql_comments(text: str) -> str:
+    """Remove SQL comments before inspecting declarations, not SQL strings."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    return re.sub(r"--[^\r\n]*", " ", text)
+
+
+def _balanced_sql_body(text: str, opening: int) -> tuple[str, int] | None:
+    """Return text inside a parenthesized SQL expression.
+
+    v4.3 Oracle/Yashan declarations are sometimes inside a quoted
+    ``EXECUTE IMMEDIATE`` block.  This small scanner handles nested type
+    parentheses and doubled single quotes without attempting to execute SQL.
+    """
+    if opening >= len(text) or text[opening] != "(":
+        return None
+    depth = 0
+    quote: str | None = None
+    index = opening
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if char == "'" or char == '"':
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[opening + 1:index], index
+        index += 1
+    return None
+
+
+def _split_sql_top_level(text: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if char == "'" or char == '"':
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+        index += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _declared_table_columns(text: str) -> dict[str, set[str]]:
+    """Extract table columns from direct and quoted CREATE/ALTER TABLE SQL."""
+    source = _strip_sql_comments(text)
+    tables: dict[str, set[str]] = {}
+    create_pattern = re.compile(
+        r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:[A-Z0-9_]+\.)?([A-Z0-9_]+)\s*\(", re.IGNORECASE,
+    )
+    for match in create_pattern.finditer(source):
+        body = _balanced_sql_body(source, match.end() - 1)
+        if body is None:
+            continue
+        columns = tables.setdefault(match.group(1).upper(), set())
+        for part in _split_sql_top_level(body[0]):
+            token = re.match(r"\s*([A-Z][A-Z0-9_]*)\b", part, re.IGNORECASE)
+            if not token:
+                continue
+            name = token.group(1).upper()
+            if name not in {"CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"}:
+                columns.add(name)
+
+    alter_pattern = re.compile(
+        r"\bALTER\s+TABLE\s+(?:[A-Z0-9_]+\.)?([A-Z0-9_]+)\s+"
+        r"ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?",
+        re.IGNORECASE,
+    )
+    for match in alter_pattern.finditer(source):
+        table = match.group(1).upper()
+        rest = source[match.end():].lstrip()
+        if rest.startswith("("):
+            body = _balanced_sql_body(source, match.end() + len(source[match.end():]) - len(rest))
+            if body is None:
+                continue
+            columns = tables.setdefault(table, set())
+            for part in _split_sql_top_level(body[0]):
+                token = re.match(r"\s*([A-Z][A-Z0-9_]*)\b", part, re.IGNORECASE)
+                if token:
+                    columns.add(token.group(1).upper())
+        else:
+            token = re.match(r"([A-Z][A-Z0-9_]*)\b", rest, re.IGNORECASE)
+            if token:
+                tables.setdefault(table, set()).add(token.group(1).upper())
+    for match in re.finditer(
+        r"\bADD_COLUMN\s*\(\s*'([A-Z0-9_]+)'\s*,\s*'([A-Z0-9_]+)'",
+        source,
+        re.IGNORECASE,
+    ):
+        tables.setdefault(match.group(1).upper(), set()).add(match.group(2).upper())
+    return tables
+
+
+def _declared_indexes(text: str) -> dict[str, dict[str, Any]]:
+    source = _strip_sql_comments(text)
+    result: dict[str, dict[str, Any]] = {}
+    pattern = re.compile(
+        r"\bCREATE\s+(UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:[A-Z0-9_]+\.)?([A-Z0-9_]+)\s+ON\s+"
+        r"(?:[A-Z0-9_]+\.)?([A-Z0-9_]+)\s*\(", re.IGNORECASE,
+    )
+    for match in pattern.finditer(source):
+        body = _balanced_sql_body(source, match.end() - 1)
+        result[match.group(2).upper()] = {
+            "table": match.group(3).upper(),
+            "unique": bool(match.group(1)),
+            "columns": body[0].strip().upper() if body else "",
+        }
+    return result
+
+
+def _normalized_marker_text(text: str) -> str:
+    return re.sub(r"\s+", " ", _strip_sql_comments(text)).strip().upper()
+
+
+def _v43_stage_requirements(stage: str) -> tuple[set[str], dict[str, frozenset[str]], set[str], set[str], set[str]]:
+    if stage not in {"identity", "governance", "security"}:
+        raise ValueError(f"unknown v4.3 stage: {stage}")
+    tables = set(V43_BASE_TABLES)
+    columns = dict(V43_BASE_REQUIRED_COLUMNS)
+    indexes = set(V43_BASE_INDEXES)
+    rls_tables = set(V43_PG_RLS_TABLES.intersection(tables))
+    policies = {
+        name for name in V43_PG_RLS_POLICIES
+        if not name.startswith(("CX_CHANNEL_THREAD_", "CX_MFA_", "CX_RESET_", "CX_DELEGATION_", "CX_LEGACY_", "CX_DERIVED_"))
+    }
+    if stage in {"governance", "security"}:
+        tables.update(V43_GOVERNANCE_TABLES)
+        columns.update(V43_GOVERNANCE_REQUIRED_COLUMNS)
+        indexes.update(V43_GOVERNANCE_INDEXES)
+        rls_tables.update(V43_PG_RLS_TABLES.intersection(V43_GOVERNANCE_TABLES))
+        policies.update({name for name in V43_PG_RLS_POLICIES if name.startswith("CX_CHANNEL_THREAD_")})
+    if stage == "security":
+        tables.update(V43_SECURITY_TABLES)
+        columns = dict(V43_REQUIRED_COLUMNS)
+        indexes.update(V43_SECURITY_INDEXES)
+        rls_tables.update(V43_PG_RLS_TABLES.intersection(V43_SECURITY_TABLES))
+        policies.update({
+            name for name in V43_PG_RLS_POLICIES
+            if name.startswith(("CX_MFA_", "CX_RESET_", "CX_DELEGATION_", "CX_LEGACY_", "CX_DERIVED_"))
+        })
+    return tables, columns, indexes, rls_tables, policies
+
+
+def _snapshot_index_info(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    indexes = snapshot.get("indexes") or {}
+    if isinstance(indexes, dict):
+        return {str(name).upper(): dict(value or {}) for name, value in indexes.items()}
+    return {str(name).upper(): {} for name in indexes}
+
+
+def _catalog_index_is_unique(value: Any) -> bool:
+    """Normalize unique-index flags returned by the supported catalogs."""
+    return str(value or "").strip().upper() in {"UNIQUE", "Y", "YES", "TRUE"}
+
+
+def validate_v43_catalog_snapshot(
+    database: str,
+    snapshot: dict[str, Any],
+    *,
+    require_runtime_permissions: bool = False,
+) -> dict[str, Any]:
+    """Validate a catalog snapshot without connecting to or changing a DB."""
+    present_tables = {str(item).upper() for item in (snapshot.get("tables") or set())}
+    columns = {
+        str(table).upper(): {str(item).upper() for item in values}
+        for table, values in (snapshot.get("columns") or {}).items()
+    }
+    index_info = _snapshot_index_info(snapshot)
+    stage_reports: dict[str, dict[str, Any]] = {}
+    for stage in ("identity", "governance", "security"):
+        tables, required_columns, required_indexes, required_rls, required_policies = _v43_stage_requirements(stage)
+        missing_tables = sorted(tables - present_tables)
+        missing_columns = {
+            table: sorted(set(required) - columns.get(table, set()))
+            for table, required in required_columns.items()
+            if set(required) - columns.get(table, set())
+        }
+        missing_indexes = sorted(
+            name for name in required_indexes
+            if name not in index_info
+            or str(index_info[name].get("table") or "").upper() != V43_INDEX_CONTRACT[name][0]
+            or (V43_INDEX_CONTRACT[name][1] and not _catalog_index_is_unique(index_info[name].get("unique")))
+        )
+        missing_rls = sorted(
+            required_rls - {str(item).upper() for item in (snapshot.get("rls_tables") or set())}
+        ) if database == "pg" else []
+        missing_policies = sorted(
+            required_policies - {str(item).upper() for item in (snapshot.get("policies") or set())}
+        ) if database == "pg" else []
+        stage_reports[stage] = {
+            "tables_required": len(tables),
+            "tables_present": len(tables - set(missing_tables)),
+            "missing_tables": missing_tables,
+            "missing_columns": missing_columns,
+            "missing_indexes": missing_indexes,
+            "missing_rls_tables": missing_rls,
+            "missing_policies": missing_policies,
+            "passed": not (missing_tables or missing_columns or missing_indexes or missing_rls or missing_policies),
+        }
+
+    permission_passed = bool(snapshot.get("permission_contract_passed", True))
+    permission_missing = list(snapshot.get("missing_privileges") or [])
+    if require_runtime_permissions and not permission_passed:
+        permission_missing = permission_missing or ["runtime permission contract"]
+    schema_passed = stage_reports["security"]["passed"]
+    return {
+        "database": database,
+        "stages": stage_reports,
+        "schema_passed": schema_passed,
+        "permission_contract_passed": permission_passed,
+        "missing_privileges": permission_missing,
+        "passed": schema_passed and (permission_passed if require_runtime_permissions else True),
+    }
+
+
+def v43_partial_schema_incomplete(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only partial objects that cannot be safely adopted or retried."""
+    present_tables = {str(item).upper() for item in (snapshot.get("tables") or set())}
+    columns = {
+        str(table).upper(): {str(item).upper() for item in values}
+        for table, values in (snapshot.get("columns") or {}).items()
+    }
+    incomplete: list[dict[str, Any]] = []
+    for table in sorted(present_tables.intersection(V43_REQUIRED_TABLES)):
+        if table in V43_BASE_TABLES:
+            required = set(V43_BASE_REQUIRED_COLUMNS.get(table, frozenset()))
+            required -= set(V43_EARLY_ADDITIVE_COLUMNS.get(table, frozenset()))
+        else:
+            required = set(V43_REQUIRED_COLUMNS.get(table, frozenset()))
+        missing = sorted(required - columns.get(table, set()))
+        if missing:
+            incomplete.append({"table": table, "missing_columns": missing})
+    return incomplete
+
+
+def v43_additive_columns_missing(snapshot: dict[str, Any]) -> bool:
+    present_tables = {str(item).upper() for item in (snapshot.get("tables") or set())}
+    columns = {
+        str(table).upper(): {str(item).upper() for item in values}
+        for table, values in (snapshot.get("columns") or {}).items()
+    }
+    return any(
+        table in present_tables and set(required) - columns.get(table, set())
+        for table, required in V43_EARLY_ADDITIVE_COLUMNS.items()
+    )
+
+
+def validate_v43_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate v4.3 SQL declarations using only local files."""
+    selected = {path.name: path for path in scripts}
+    missing_scripts = [name for name in V43_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()]
+    sql_parts = [path.read_text(encoding="utf-8") for path in scripts if path.is_file()]
+    deploy_dir = next((path.parent for path in scripts if path.is_file()), None)
+    if deploy_dir:
+        grants = deploy_dir / "4_grants.sql"
+        if grants.is_file():
+            sql_parts.append(grants.read_text(encoding="utf-8"))
+    source = "\n".join(sql_parts)
+    declared_tables = _declared_table_columns(source)
+    declared_indexes = _declared_indexes(source)
+    missing_tables = sorted(set(V43_REQUIRED_TABLES) - set(declared_tables))
+    missing_columns = {
+        table: sorted(set(required) - declared_tables.get(table, set()))
+        for table, required in V43_REQUIRED_COLUMNS.items()
+        if set(required) - declared_tables.get(table, set())
+    }
+    missing_indexes = sorted(
+        name for name, (table, unique) in V43_INDEX_CONTRACT.items()
+        if name not in declared_indexes
+        or declared_indexes[name]["table"] != table
+        or (unique and not declared_indexes[name]["unique"])
+    )
+    marker_text = _normalized_marker_text(source)
+    if database == "pg":
+        missing_rls_tables = sorted(
+            table for table in V43_PG_RLS_TABLES
+            if not re.search(rf"\bALTER\s+TABLE\s+(?:PUBLIC\.)?{table}\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY\b", marker_text)
+        )
+        declared_policies = {name.upper() for name in re.findall(r"\bCREATE\s+POLICY\s+([A-Z0-9_]+)", marker_text)}
+        missing_policies = sorted(V43_PG_RLS_POLICIES - declared_policies)
+        missing_permissions = [marker for marker in V43_PG_PERMISSION_MARKERS if marker not in marker_text]
+    else:
+        missing_rls_tables = []
+        missing_policies = []
+        missing_permissions = [marker for marker in V43_NATIVE_PERMISSION_MARKERS if marker not in marker_text]
+    return {
+        "database": database,
+        "scripts_required": list(V43_MIGRATION_SCRIPTS),
+        "scripts_missing": missing_scripts,
+        "tables_missing": missing_tables,
+        "columns_missing": missing_columns,
+        "indexes_missing": missing_indexes,
+        "rls_tables_missing": missing_rls_tables,
+        "policies_missing": missing_policies,
+        "permissions_missing": missing_permissions,
+        "passed": not any((missing_scripts, missing_tables, missing_columns, missing_indexes, missing_rls_tables, missing_policies, missing_permissions)),
+    }
+
+
+def validate_v431_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the additive v4.3.1 organization declarations locally."""
+    base = validate_v43_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    missing_scripts = [
+        name for name in V431_MIGRATION_SCRIPTS
+        if name not in selected or not selected[name].is_file()
+    ]
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in scripts if path.is_file()
+    )
+    declared_tables = _declared_table_columns(source)
+    declared_indexes = _declared_indexes(source)
+    missing_tables = sorted(set(V431_ORGANIZATION_TABLES) - set(declared_tables))
+    missing_columns = {
+        table: sorted(set(required) - declared_tables.get(table, set()))
+        for table, required in V431_ORGANIZATION_REQUIRED_COLUMNS.items()
+        if set(required) - declared_tables.get(table, set())
+    }
+    for table, required in V431_ENTRY_ACCESS_REQUIRED_COLUMNS.items():
+        missing = set(required) - declared_tables.get(table, set())
+        if missing:
+            missing_columns.setdefault(table, []).extend(sorted(missing))
+    missing_indexes = sorted(
+        name for name, (table, unique) in V431_INDEX_CONTRACT.items()
+        if name not in declared_indexes
+        or declared_indexes[name]["table"] != table
+        or (unique and not declared_indexes[name]["unique"])
+    )
+    organization = {
+        "scripts_required": list(V431_MIGRATION_SCRIPTS),
+        "scripts_missing": missing_scripts,
+        "tables_missing": missing_tables,
+        "columns_missing": missing_columns,
+        "indexes_missing": missing_indexes,
+    }
+    organization["passed"] = not any(
+        (missing_scripts, missing_tables, missing_columns, missing_indexes)
+    )
+    return {
+        "database": database,
+        "v43": base,
+        "organization": organization,
+        "passed": bool(base.get("passed")) and bool(organization["passed"]),
+    }
+
+
+def validate_v432_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the additive v4.3.2 versioned-memory declarations locally."""
+    base = validate_v431_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("23_v4_3_2_memory_lifecycle.sql")
+    alignment = selected.get("24_v4_3_2_memory_digest_alignment.sql")
+    scheduler_correction = selected.get("25_v4_3_2_disable_legacy_memory_fusion.sql")
+    snapshot_fencing = selected.get("26_v4_3_2_snapshot_subject_fencing.sql")
+    completion = selected.get("27_v4_3_2_memory_governance_completion.sql")
+    source = migration.read_text(encoding="utf-8") if migration and migration.is_file() else ""
+    alignment_source = alignment.read_text(encoding="utf-8") if alignment and alignment.is_file() else ""
+    scheduler_source = scheduler_correction.read_text(encoding="utf-8") if scheduler_correction and scheduler_correction.is_file() else ""
+    fencing_source = snapshot_fencing.read_text(encoding="utf-8") if snapshot_fencing and snapshot_fencing.is_file() else ""
+    completion_source = completion.read_text(encoding="utf-8") if completion and completion.is_file() else ""
+    normalized = _normalized_marker_text(source)
+    all_memory_source = normalized + _normalized_marker_text(fencing_source) + _normalized_marker_text(completion_source)
+    missing_tables = [name for name in V432_MEMORY_TABLES if name not in all_memory_source]
+    missing_columns = {
+        table: sorted(column for column in required if column not in all_memory_source)
+        for table, required in V432_MEMORY_REQUIRED_COLUMNS.items()
+        if any(column not in all_memory_source for column in required)
+    }
+    memory = {
+        "scripts_required": list(V432_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V432_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": missing_tables,
+        "columns_missing": missing_columns,
+        "digest_alignment": bool(alignment_source) and (
+            "SHA256(" in alignment_source.upper()
+            if database == "pg" else (
+                "STANDARD_HASH(" in alignment_source.upper()
+                if database == "oracle" else "DBMS_CRYPTO.HASH" in alignment_source.upper()
+            )
+        ),
+        "legacy_fusion_disabled": "MEMORY_FUSION_JOB" in scheduler_source.upper() and (
+            "CRON.UNSCHEDULE" in scheduler_source.upper()
+            if database == "pg" else "DBMS_SCHEDULER.DROP_JOB" in scheduler_source.upper()
+        ),
+    }
+    memory["passed"] = not any((memory["scripts_missing"], memory["tables_missing"], memory["columns_missing"])) and memory["digest_alignment"] and memory["legacy_fusion_disabled"]
+    return {"database": database, "v431": base, "memory": memory,
+            "passed": bool(base.get("passed")) and bool(memory["passed"])}
+
+
+def validate_v433_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the additive v4.3.3 runtime-assurance declarations."""
+    base = validate_v432_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("28_v4_3_3_graph_assurance.sql")
+    raw_source = migration.read_text(encoding="utf-8") if migration and migration.is_file() else ""
+    source = _normalized_marker_text(raw_source)
+    assurance = {
+        "scripts_required": list(V433_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V433_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V433_GRAPH_ASSURANCE_TABLES if name not in source],
+        "no_private_key_storage": "PRIVATE_KEY" not in source,
+    }
+    assurance["passed"] = not any((assurance["scripts_missing"], assurance["tables_missing"])) and assurance["no_private_key_storage"]
+    return {"database": database, "v432": base, "graph_assurance": assurance,
+            "passed": bool(base.get("passed")) and bool(assurance["passed"])}
+
+
+def validate_v434_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the additive v4.3.4 compliance migration source."""
+    base = validate_v433_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("29_v4_3_4_agent_compliance.sql")
+    source = _normalized_marker_text(migration.read_text(encoding="utf-8")) if migration and migration.is_file() else ""
+    compliance = {
+        "scripts_required": list(V434_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V434_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V434_COMPLIANCE_TABLES if name not in source],
+        "no_profile_secret_storage": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "ACCESS_TOKEN")),
+    }
+    compliance["passed"] = not any((compliance["scripts_missing"], compliance["tables_missing"])) and compliance["no_profile_secret_storage"]
+    return {"database": database, "v433": base, "compliance": compliance,
+            "passed": bool(base.get("passed")) and bool(compliance["passed"])}
+
+
+def validate_v435_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the additive v4.3.5 platform capability declarations."""
+    # Community packages intentionally omit the Enterprise compliance overlay.
+    # Keep the common v4.3.3 chain mandatory, while validating 4.3.4 only when
+    # its scripts are physically present in the package.
+    base = validate_v433_static_contract(database, scripts)
+    compliance_present = any(
+        path.name == "29_v4_3_4_agent_compliance.sql" and path.is_file()
+        for path in scripts
+    )
+    if compliance_present:
+        base = validate_v434_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("31_v4_3_5_platform_capabilities.sql")
+    source = _normalized_marker_text(migration.read_text(encoding="utf-8")) if migration and migration.is_file() else ""
+    optional_overlay = {"29_v4_3_4_agent_compliance.sql", "30_v4_3_4_compliance_hardening.sql"}
+    capability = {
+        "scripts_required": list(V435_MIGRATION_SCRIPTS),
+        "scripts_missing": [
+            name for name in V435_MIGRATION_SCRIPTS
+            if name not in optional_overlay and (name not in selected or not selected[name].is_file())
+        ],
+        "tables_missing": [name for name in V435_PLATFORM_TABLES if name not in source],
+        "no_secret_storage": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "ACCESS_TOKEN", "PASSWORD")),
+    }
+    capability["passed"] = not any((capability["scripts_missing"], capability["tables_missing"])) and capability["no_secret_storage"]
+    return {"database": database, "v434": base, "platform_capabilities": capability,
+            "passed": bool(base.get("passed")) and bool(capability["passed"])}
+
+
+def validate_v436_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the additive v4.3.6 native Agent declarations."""
+    base = validate_v435_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("32_v4_3_6_native_agents.sql")
+    source = _normalized_marker_text(migration.read_text(encoding="utf-8")) if migration and migration.is_file() else ""
+    native = {
+        "scripts_required": list(V436_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V436_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V436_NATIVE_AGENT_TABLES if name not in source],
+        "encrypted_secret_column": "API_KEY_CIPHER" in source,
+        "no_plaintext_secret_markers": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "PASSWORD")),
+    }
+    native["passed"] = not any((native["scripts_missing"], native["tables_missing"])) and native["encrypted_secret_column"] and native["no_plaintext_secret_markers"]
+    return {"database": database, "v435": base, "native_agents": native,
+            "passed": bool(base.get("passed")) and bool(native["passed"])}
+
+
+def validate_v437_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate deterministic deployment and Embedding governance declarations."""
+    base = validate_v436_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("33_v4_3_7_bootstrap_embedding.sql")
+    source = _normalized_marker_text(migration.read_text(encoding="utf-8")) if migration and migration.is_file() else ""
+    bootstrap = {
+        "scripts_required": list(V437_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V437_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V437_BOOTSTRAP_TABLES if name not in source],
+        "contract_markers": all(marker in source for marker in ("EMBEDDING_SPACE_ID", "EMBEDDING_CONTRACT_ID", "MODEL_FINGERPRINT", "LEGACY_DEFAULT")),
+        "no_plaintext_secret_markers": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "PASSWORD")),
+    }
+    bootstrap["passed"] = not any((bootstrap["scripts_missing"], bootstrap["tables_missing"])) and bootstrap["contract_markers"] and bootstrap["no_plaintext_secret_markers"]
+    return {"database": database, "v436": base, "bootstrap_embedding": bootstrap,
+            "passed": bool(base.get("passed")) and bool(bootstrap["passed"])}
+
+
+def validate_v440_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate v4.4.0 native SDD declarations without a database connection."""
+    base = validate_v437_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("34_v4_4_0_governed_sdd.sql")
+    raw_source = migration.read_text(encoding="utf-8") if migration and migration.is_file() else ""
+    source = _normalized_marker_text(raw_source)
+    sdd = {
+        "scripts_required": list(V440_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V440_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V440_SDD_TABLES if name not in source],
+        "baseline_markers": all(marker in raw_source.upper() for marker in ("APPROVED_BASELINE", "EXPECTED_VERSION", "ARTIFACT_DIGEST")),
+        "no_plaintext_secret_markers": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "PASSWORD")),
+    }
+    sdd["passed"] = not any((sdd["scripts_missing"], sdd["tables_missing"])) and sdd["baseline_markers"] and sdd["no_plaintext_secret_markers"]
+    return {"database": database, "v437": base, "native_sdd": sdd,
+            "passed": bool(base.get("passed")) and bool(sdd["passed"])}
+
+
+def validate_v441_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate v4.4.1 management-plane declarations without a database."""
+    base = validate_v440_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migrations = [selected.get(name) for name in (
+        "35_v4_4_1_admin_ha_upgrade.sql", "36_v4_4_1_upgrade_protocol.sql",
+    )]
+    raw_source = "\n".join(
+        migration.read_text(encoding="utf-8") for migration in migrations
+        if migration and migration.is_file()
+    )
+    source = _normalized_marker_text(raw_source)
+    control = {
+        "scripts_required": list(V441_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V441_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V441_ADMIN_HA_TABLES if name not in source],
+        "safety_markers": all(marker in raw_source.upper() for marker in ("FENCING_TOKEN", "CONTROL_GENERATION", "SECRET_FREE", "SIGNATURE_STATE")),
+        "no_plaintext_secret_markers": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "PASSWORD")),
+    }
+    control["passed"] = not any((control["scripts_missing"], control["tables_missing"])) and control["safety_markers"] and control["no_plaintext_secret_markers"]
+    return {"database": database, "v440": base, "admin_ha_upgrade": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v442_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate v4.4.2 additive operations and Graph profile declarations."""
+    base = validate_v441_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    sources = [
+        selected.get("37_v4_4_2_embedding_graph_operations.sql"),
+        selected.get("38_v4_4_2_channel_pinning.sql"),
+    ]
+    raw_source = "\n".join(path.read_text(encoding="utf-8") for path in sources if path and path.is_file())
+    source = _normalized_marker_text(raw_source)
+    control = {
+        "scripts_required": list(V442_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V442_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V442_GRAPH_OPERATIONS_TABLES if name not in source],
+        "states_present": all(marker in raw_source.upper() for marker in ("ENABLED", "CONTROLLED", "DISABLED", "UNAVAILABLE")),
+        "safety_markers": all(marker in raw_source.upper() for marker in ("RESPONSE_DIGEST", "ATTEMPT_DIGEST", "SSH_TRUST_MODE", "PINNED")),
+        "no_plaintext_secret_markers": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "PASSWORD")),
+    }
+    control["passed"] = not control["scripts_missing"] and not control["tables_missing"] and control["states_present"] and control["safety_markers"] and control["no_plaintext_secret_markers"]
+    return {"database": database, "v441": base, "v442_operations": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v443_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    """Validate the v4.4.3 Security Domain binding boundary declarations."""
+    base = validate_v442_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("39_v4_4_3_security_domain_binding.sql")
+    raw_source = migration.read_text(encoding="utf-8") if migration and migration.is_file() else ""
+    source = _normalized_marker_text(raw_source)
+    control = {
+        "scripts_required": list(V443_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V443_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V443_SECURITY_DOMAIN_TABLES if name not in source],
+        "boundary_markers": all(marker in raw_source.upper() for marker in (
+            "LEGACY_COLLAB_GROUP", "CX_DOMAIN_BINDINGS", "CX_DOMAIN_CONVERSION_DRAFTS", "CX_DOMAIN_DRAFT_MEMBERS",
+        )),
+        "single_active_group_binding": "ACTIVE_GROUP" in raw_source.upper() or "ACTIVE_GROUP" in source,
+        "no_plaintext_secret_markers": not any(marker in source for marker in ("PRIVATE_KEY", "CLIENT_SECRET", "PASSWORD")),
+    }
+    control["passed"] = not control["scripts_missing"] and not control["tables_missing"] and control["boundary_markers"] and control["single_active_group_binding"] and control["no_plaintext_secret_markers"]
+    return {"database": database, "v442": base, "v443_security_domain_binding": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v444_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    base = validate_v443_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("40_v4_4_4_agent_pool_cloud.sql")
+    raw_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in selected.values()
+        if path.is_file() and path.name in {"40_v4_4_4_agent_pool_cloud.sql", "41_v4_4_4_node_storage_binding.sql", "42_v4_4_4_storage_purpose.sql", "43_v4_4_4_agent_pool_node_onboarding.sql", "44_v4_4_4_managed_node_local_info_path.sql"}
+    )
+    source = _normalized_marker_text(raw_source)
+    control = {
+        "scripts_required": list(V444_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V444_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "tables_missing": [name for name in V444_AGENT_POOL_TABLES if name not in source],
+        "template_keys_present": all(key in raw_source for key in ("CODE_PLAN", "CODE_PROGRAM", "CODE_REVIEW", "OFFICE_TEXT", "PPT_DESIGN")),
+        "no_reusable_ssh_password": "SSH_PASSWORD" not in source and "PASSWORD" not in source,
+    }
+    control["passed"] = not control["scripts_missing"] and not control["tables_missing"] and control["template_keys_present"] and control["no_reusable_ssh_password"]
+    return {"database": database, "v443": base, "v444_agent_pool": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v445_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    base = validate_v444_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("45_v4_4_5_graph_run_contract.sql")
+    source = migration.read_text(encoding="utf-8").upper() if migration and migration.is_file() else ""
+    markers = {
+        "DEFINITION_DIGEST", "PLAN_DIGEST", "COMPATIBILITY_LEVEL",
+        "STATE_SCHEMA_VERSION", "BUDGET_SCHEMA_VERSION", "GRAPH_COMPILE_PLANS",
+    }
+    native_revoke_markers = {
+        "REVOKE SELECT ON AIADMIN.COLLAB_GROUPS FROM AGENT_API",
+        "REVOKE SELECT ON AIADMIN.COLLAB_GROUP_MEMBERS FROM AGENT_API",
+    }
+    control = {
+        "scripts_required": list(V445_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V445_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "contract_markers_missing": sorted(marker for marker in markers if marker not in source),
+        "plan_version_binding": "P.GRAPH_VERSION_ID = R.GRAPH_VERSION_ID" in source,
+    }
+    control["passed"] = not control["scripts_missing"] and not control["contract_markers_missing"] and control["plan_version_binding"]
+    return {"database": database, "v444": base, "v445_graph_run_contract": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v446_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    base = validate_v445_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("46_v4_4_6_identity_portal_graph.sql")
+    source = migration.read_text(encoding="utf-8").upper() if migration and migration.is_file() else ""
+    markers = {"HUMAN_REGISTRATION", "PORTAL_CONNECTION", "PORTAL_PAGE", "EXTERNAL", "GRAPH_CAP", "TOKEN_DIGEST", "FENCING_TOKEN"}
+    control = {
+        "scripts_required": list(V446_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V446_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "contract_markers_missing": sorted(marker for marker in markers if marker not in source),
+        "private_lifecycle_logic_absent": all(term not in source for term in ("CREATE USER", "PASSWORD", "OBSERVER")),
+    }
+    control["passed"] = not control["scripts_missing"] and not control["contract_markers_missing"] and control["private_lifecycle_logic_absent"]
+    return {"database": database, "v445": base, "v446_identity_portal_graph": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v448_static_contract(database: str, scripts: Sequence[Path]) -> dict[str, Any]:
+    base = validate_v446_static_contract(database, scripts)
+    selected = {path.name: path for path in scripts}
+    contract = selected.get("48_v4_4_8_platform_agent_isolation.sql")
+    domain = selected.get("49_v4_4_8_security_domain_rls.sql")
+    contract_text = contract.read_text(encoding="utf-8").upper() if contract and contract.is_file() else ""
+    domain_text = domain.read_text(encoding="utf-8").upper() if domain and domain.is_file() else ""
+    markers = {
+        "CX_PLATFORM_COMMANDS", "CX_PLATFORM_COMMAND_EXECUTORS",
+        "CX_PLATFORM_MAINTENANCE_TASKS", "CX_PLATFORM_SAFE_AUTONOMY_POLICIES",
+        "CX_PLATFORM_KNOWLEDGE", "CX_PLATFORM_KNOWLEDGE_CHUNKS",
+        "CX_PLATFORM_KNOWLEDGE_GRANTS", "CX_DATABASE_ISOLATION_INVENTORY",
+        "SAFE AUTONOMY IS DISABLED BY DEFAULT", "EMERGENCY_CONTAINMENT",
+        "GOVERNED_EXECUTOR", "PROPOSAL_ONLY",
+        "GRAPH_RUN_ID",
+    }
+    pg_markers = {
+        "ENABLE ROW LEVEL SECURITY", "FORCE ROW LEVEL SECURITY",
+        "REVOKE ALL PRIVILEGES", "CX_PLATFORM_KNOWLEDGE_CHUNKS",
+    }
+    native_revoke_markers = {
+        "REVOKE SELECT ON AIADMIN.COLLAB_GROUPS FROM AGENT_API",
+        "REVOKE SELECT ON AIADMIN.COLLAB_GROUP_MEMBERS FROM AGENT_API",
+    }
+    domain_markers = set() if database != "pg" else {
+        "CX_CHANNEL_DOMAIN_MEMBER", "CX_DOMAIN_MEMBERS",
+        "CURRENT_USER", "AGENT_DB_IDENTITY", "CURRENT_AGENT_ID",
+    }
+    control = {
+        "scripts_required": list(V448_MIGRATION_SCRIPTS),
+        "scripts_missing": [name for name in V448_MIGRATION_SCRIPTS if name not in selected or not selected[name].is_file()],
+        "contract_markers_missing": sorted(marker for marker in markers if marker not in contract_text),
+        "domain_markers_missing": sorted(marker for marker in domain_markers if marker not in domain_text),
+    }
+    if database == "pg":
+        control["pg_markers_missing"] = sorted(marker for marker in pg_markers if marker not in contract_text)
+    else:
+        control["native_revoke_markers_missing"] = sorted(
+            marker for marker in native_revoke_markers if marker not in contract_text
+        )
+    control["passed"] = (
+        not control["scripts_missing"]
+        and not control["contract_markers_missing"]
+        and not control["domain_markers_missing"]
+        and (database != "pg" or not control.get("pg_markers_missing"))
+        and (database == "pg" or not control.get("native_revoke_markers_missing"))
+    )
+    return {"database": database, "v446": base, "v448_platform_agent_isolation": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v449_static_contract(
+    database: str, scripts: Sequence[Path], edition: str = "enterprise",
+) -> dict[str, Any]:
+    """Validate the v4.4.9 repair scripts without treating v4.4.8 as a baseline."""
+    selected = {path.name: path for path in scripts}
+    repair = selected.get("50_v4_4_9_security_boundary_repair.sql")
+    identity = selected.get("51_v4_4_9_identity_boundary_repair.sql") if database == "pg" else None
+    runtime_boundary = selected.get("53_v4_4_9_pg_runtime_boundary.sql") if database == "pg" else None
+    audit_contract = selected.get("54_v4_4_9_audit_data_contract.sql")
+    repair_text = repair.read_text(encoding="utf-8").upper() if repair and repair.is_file() else ""
+    identity_text = identity.read_text(encoding="utf-8").upper() if identity and identity.is_file() else ""
+    runtime_boundary_text = runtime_boundary.read_text(encoding="utf-8").upper() if runtime_boundary and runtime_boundary.is_file() else ""
+    audit_contract_text = audit_contract.read_text(encoding="utf-8").upper() if audit_contract and audit_contract.is_file() else ""
+    markers = {"CX_PLATFORM_MAINTENANCE_TASKS", "CX_PLATFORM_KNOWLEDGE"}
+    if database == "pg":
+        markers.add("FORCE ROW LEVEL SECURITY")
+    identity_markers = {"CURRENT_AGENT_IDENTITY", "AGENT_DB_IDENTITY", "CURRENT_USER"}
+    runtime_boundary_markers = {
+        "SESSION_USER", "REVOKE ALL PRIVILEGES", "CX_PLATFORM_KNOWLEDGE",
+        "CX_PLATFORM_MAINTENANCE_TASKS", "CX_PLATFORM_COMMANDS",
+    }
+    required_scripts = migration_scripts_for_edition(V449_MIGRATION_SCRIPTS, edition)
+    control = {
+        "scripts_required": list(required_scripts),
+        "scripts_missing": [name for name in required_scripts if name not in selected or not selected[name].is_file()],
+        "repair_markers_missing": sorted(marker for marker in markers if marker not in repair_text),
+        "identity_markers_missing": sorted(marker for marker in identity_markers if marker not in identity_text) if database == "pg" else [],
+        "runtime_boundary_markers_missing": sorted(marker for marker in runtime_boundary_markers if marker not in runtime_boundary_text) if database == "pg" else [],
+        "audit_contract_markers_missing": sorted(marker for marker in {"CONTEXT_AUDIT_LOG", "RESOLUTION_STATUS", "AUDIT_TYPE"} if marker not in audit_contract_text),
+        "unmapped_identity_fallback_absent": database != "pg" or "WHERE NOT EXISTS (SELECT 1 FROM PUBLIC.AGENT_DB_IDENTITY" not in identity_text,
+    }
+    control["passed"] = not control["scripts_missing"] and not control["repair_markers_missing"] and not control["identity_markers_missing"] and not control["runtime_boundary_markers_missing"] and not control["audit_contract_markers_missing"] and control["unmapped_identity_fallback_absent"]
+    return {"database": database, "v449_security_boundary_repair": control, "passed": bool(control["passed"])}
+
+
+def validate_v410_static_contract(
+    database: str, scripts: Sequence[Path], edition: str = "enterprise",
+) -> dict[str, Any]:
+    base = validate_v449_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("55_v4_4_10_model_usage_wallboard.sql")
+    repair = selected.get("56_v4_4_10_runtime_repair.sql")
+    completion = selected.get("57_v4_4_10_complete_model_governance.sql")
+    knowledge_scope = selected.get("58_v4_4_10_knowledge_scope.sql")
+    graph_context = selected.get("59_v4_4_10_knowledge_graph_context.sql")
+    approval_closure = selected.get("60_v4_4_10_organization_approval_closure.sql")
+    embedding_authorization = selected.get("61_v4_4_10_external_embedding_authorization.sql")
+    source = "\n".join(
+        item.read_text(encoding="utf-8").upper()
+        for item in (migration, repair, completion, knowledge_scope, graph_context, approval_closure, embedding_authorization) if item and item.is_file()
+    )
+    repair_source = repair.read_text(encoding="utf-8").upper() if repair and repair.is_file() else ""
+    markers = set(V410_MODEL_TABLES) | {"CX_PLATFORM_CAPABILITIES", "WALLBOARD", "IDEMPOTENCY_KEY", "IDX_MODEL_ROUTE_SCOPE_UQ", "CX_KNOWLEDGE_CONTEXTS", "ORGANIZATION_CHAIN_JSON", "GRAPH_SNAPSHOT_DIGEST", "ORGANIZATION_CHANGE", "CX_AGENT_RELATIONSHIP_HISTORY", "CX_EMBEDDING_ACCESS_GRANTS", "MAX_BATCH_SIZE", "MAX_INPUT_CHARS"}
+    if database == "pg":
+        markers |= {"FORCE ROW LEVEL SECURITY", "PUBLIC.CURRENT_AGENT_IDENTITY()", "CX_MODEL_CREDENTIALS_OWNER"}
+    required_scripts = migration_scripts_for_edition(V410_MIGRATION_SCRIPTS, edition)
+    control = {
+        "scripts_required": list(required_scripts),
+        "scripts_missing": [name for name in required_scripts if name not in selected or not selected[name].is_file()],
+        "contract_markers_missing": sorted(marker for marker in markers if marker not in source),
+        "obsolete_pg_principal_guc_absent": database != "pg" or "APP.CURRENT_PRINCIPAL_ID" not in repair_source,
+    }
+    control["passed"] = not control["scripts_missing"] and not control["contract_markers_missing"] and control["obsolete_pg_principal_guc_absent"]
+    return {"database": database, "v449": base, "v410_model_usage_wallboard": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v411_static_contract(
+    database: str, scripts: Sequence[Path], edition: str = "enterprise",
+) -> dict[str, Any]:
+    base = validate_v410_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    migrations = (selected.get("66_v4_4_11_runtime_isolation_db4a2a.sql"),
+                  selected.get("67_v4_4_11_runtime_execution_admission.sql"),
+                  selected.get("68_v4_4_11_host_provisioning.sql"))
+    source = "\n".join(item.read_text(encoding="utf-8").upper()
+                       for item in migrations if item and item.is_file())
+    markers = set(V411_RUNTIME_TABLES) | {
+        "ISOLATION_LEVEL", "ENFORCEMENT_MODE", "RUNTIME_IDENTITY", "BOUNDARIES_JSON",
+        "SNAPSHOT_DIGEST", "EXPECTED_VERSION", "BRANCH_POLICY", "CHILD_BRANCH_ID",
+        "ISOLATION_EVIDENCE_JSON", "ISOLATION_ADMITTED_AT",
+        "BOOTSTRAP_STATE", "ROOT_REMOTE_LOGIN", "RUNTIME_UID", "RUNTIME_GID",
+    }
+    if database == "pg":
+        markers |= {"ENABLE ROW LEVEL SECURITY", "FORCE ROW LEVEL SECURITY"}
+    required_scripts = migration_scripts_for_edition(V411_MIGRATION_SCRIPTS, edition)
+    control = {
+        "scripts_required": list(required_scripts),
+        "scripts_missing": [name for name in required_scripts if name not in selected or not selected[name].is_file()],
+        "contract_markers_missing": sorted(marker for marker in markers if marker not in source),
+    }
+    control["passed"] = not control["scripts_missing"] and not control["contract_markers_missing"]
+    return {"database": database, "v410": base, "v411_runtime_isolation_db4a2a": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v452_static_contract(
+    database: str, scripts: Sequence[Path], edition: str = "enterprise",
+) -> dict[str, Any]:
+    """Validate the additive v4.5.2 task-continuity migration contract."""
+    base = validate_v411_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("101_v4_5_2_task_continuity.sql")
+    source = migration.read_text(encoding="utf-8").upper() if migration and migration.is_file() else ""
+    markers = set(V452_TASK_CONTINUITY_TABLES) | {
+        "CANONICAL_TASK_ID", "LINK_KIND", "IDEMPOTENCY_KEY", "FENCING_TOKEN",
+        "LEASE_EXPIRES_AT", "UNOBSERVED", "LEGACY_UNMAPPED", "CX101_",
+    }
+    required_scripts = migration_scripts_for_edition(V452_MIGRATION_SCRIPTS, edition)
+    control = {
+        "scripts_required": list(required_scripts),
+        "scripts_missing": [name for name in required_scripts if name not in selected or not selected[name].is_file()],
+        "contract_markers_missing": sorted(marker for marker in markers if marker not in source),
+    }
+    control["passed"] = not control["scripts_missing"] and not control["contract_markers_missing"]
+    return {"database": database, "v411": base, "v452_task_continuity": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v500_static_contract(database: str, scripts: Sequence[Path], edition: str = "enterprise") -> dict[str, Any]:
+    base = validate_v452_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    migration = selected.get("102_v5_0_0_network_access.sql")
+    source = migration.read_text(encoding="utf-8").upper() if migration and migration.is_file() else ""
+    markers = {"CX_IP_ACCESS_STATE", "CX_IP_ACCESS_REVISIONS", "CX_IP_ACCESS_RULES", "CX102_", "ALLOWLIST", "DENYLIST"}
+    required = migration_scripts_for_edition(V500_MIGRATION_SCRIPTS, edition)
+    control = {"scripts_missing": [name for name in required if name not in selected or not selected[name].is_file()],
+               "contract_markers_missing": sorted(marker for marker in markers if marker not in source)}
+    control["passed"] = not control["scripts_missing"] and not control["contract_markers_missing"]
+    return {"database": database, "v452": base, "v500_source_ip_access": control,
+            "passed": bool(base.get("passed")) and bool(control["passed"])}
+
+
+def validate_v501_static_contract(database: str, scripts: Sequence[Path], edition: str = "enterprise") -> dict[str, Any]:
+    """Require the complete additive chain and generated native schema facts."""
+    base = validate_v500_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    required = migration_scripts_for_edition(V501_MIGRATION_SCRIPTS, edition)
+    missing = [name for name in required if name not in selected or not selected[name].is_file()]
+    invalid = []
+    for name in V501_MIGRATION_SCRIPTS[-3:]:
+        path = selected.get(name)
+        try:
+            facts = json.loads(path.with_suffix(".schema.json").read_text(encoding="utf-8"))
+            if not facts or not all(item.get("columns") and item.get("immutable_columns") and item.get("trigger")
+                                    for item in facts.values()):
+                invalid.append(name)
+        except (AttributeError, OSError, ValueError, TypeError):
+            invalid.append(name)
+    control = {"scripts_missing": missing, "schema_manifests_invalid": invalid,
+               "passed": not missing and not invalid}
+    return {"database": database, "v500": base, "v501_memory_context_quality": control,
+            "passed": bool(base.get("passed")) and control["passed"]}
+
+
+def validate_v502_schema_manifest(facts: Any) -> list[str]:
+    """Reject incomplete native contracts before any migration can be adopted."""
+    if not isinstance(facts, dict) or not facts:
+        return ["EMPTY_MANIFEST"]
+    failures = []
+    for table, item in facts.items():
+        if not isinstance(item, dict):
+            failures.append(str(table) + ":DEFINITION")
+            continue
+        columns = item.get("columns")
+        immutable = item.get("immutable_columns")
+        if (not isinstance(columns, dict) or not columns
+                or any(not isinstance(value, dict) or set(value) != {"type", "not_null", "default"}
+                       or not isinstance(value["type"], str) or not isinstance(value["not_null"], bool)
+                       or value["default"] is not None and not isinstance(value["default"], str)
+                       for value in columns.values())):
+            failures.append(table + ":COLUMNS")
+        if (not isinstance(immutable, list) or not immutable
+                or not all(isinstance(column, str) for column in immutable)
+                or len(set(immutable)) != len(immutable)
+                or not isinstance(columns, dict) or not set(immutable) <= set(columns)):
+            failures.append(table + ":IMMUTABLE_COLUMNS")
+        if (not item.get("trigger") or not item.get("trigger_body")
+                or item.get("grant_policy") != "NO_NON_OWNER_GRANTS"):
+            failures.append(table + ":NATIVE_BOUNDARY")
+        indexes = item.get("indexes")
+        if (not isinstance(indexes, list) or any(
+                not isinstance(index, dict) or set(index) != {"name", "columns", "unique"}
+                or not isinstance(index["name"], str) or not index["name"]
+                or not isinstance(index["columns"], list) or not index["columns"]
+                or not all(isinstance(column, str) for column in index["columns"])
+                or index["unique"] is not False or not isinstance(columns, dict)
+                or not set(index["columns"]) <= set(columns) for index in indexes or [])):
+            failures.append(table + ":INDEXES")
+        if (not isinstance(item.get("keys"), list) or not isinstance(item.get("checks"), int)
+                or not isinstance(item.get("check_expressions"), list)
+                or item.get("checks") != len(item.get("check_expressions", []))):
+            failures.append(table + ":CONSTRAINTS")
+    return failures
+
+
+def validate_v502_approval_repair_manifest(facts: Any) -> list[str]:
+    """A legacy CHECK repair must not claim new immutable tables or grants."""
+    return ([] if isinstance(facts, dict) and facts == V502_PG_APPROVAL_REPAIR_MANIFEST
+            and facts.get('preserve_other_constraints') is True else ["APPROVAL_REPAIR_MANIFEST"])
+
+
+def _pg_approval_check_values(expression: str, column: str) -> list[str] | None:
+    """Accept only the native enum predicate, preserving every literal exactly."""
+    if not isinstance(expression, str) or len(expression) > 4096:
+        return None
+    parts = re.findall(r"'(?:[^']|'')*'|[^']+", expression)
+    normalized = "".join(part if part.startswith("'") else re.sub(r'[\s()"]', '', re.sub(
+        r'::(?:character varying|text)(?:\[\])?', '', part)).upper() for part in parts)
+    matched = re.fullmatch(re.escape(column) + r"=ANYARRAY\[((?:'[A-Z_]+'(?:,'[A-Z_]+')*))\]", normalized)
+    if not matched:
+        return None
+    values = re.findall(r"'([A-Z_]+)'", matched[1])
+    return values if len(values) == len(set(values)) else None
+
+
+def v502_pg_approval_boundary_errors(cursor: Any, facts: Any) -> list[str]:
+    failures = validate_v502_approval_repair_manifest(facts)
+    if failures:
+        return failures
+    cursor.execute(
+        "SELECT upper(c.conname),c.convalidated,c.connoinherit,c.conislocal,c.coninhcount,"
+        "ARRAY(SELECT upper(a.attname) FROM unnest(c.conkey) WITH ORDINALITY k(num,ord) "
+        "JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.num ORDER BY k.ord),"
+        "pg_get_expr(c.conbin,c.conrelid) FROM pg_constraint c "
+        "WHERE c.conrelid=to_regclass(format('%I.approval_requests',current_schema())) AND c.contype='c'")
+    constraints = cursor.fetchall()
+    seen = set()
+    for name, validated, noinherit, islocal, inherited, columns, expression in constraints:
+        if name in seen:
+            failures.append("DUPLICATE_CHECK:" + name)
+        seen.add(name)
+        if name == "CK_AR_ENTITY":
+            failures.append("LEGACY_RESTRICTIVE_CHECK")
+        expected = facts['required_constraints'].get(name)
+        if expected:
+            values = _pg_approval_check_values(expression, expected['column'])
+            if (validated is not True or noinherit is not False or islocal is not True or inherited != 0
+                    or list(columns) != [expected['column']] or values is None
+                    or set(values) != set(expected['allowed_values'])):
+                failures.append("CHECK_DEFINITION:" + name)
+        elif set(columns) & {'ENTITY_TYPE', 'APPROVAL_STATUS'}:
+            failures.append("UNKNOWN_ENUM_CHECK:" + name)
+    failures.extend("MISSING_CHECK:" + name for name in facts['required_constraints'] if name not in seen)
+    return failures
+
+
+def validate_v502_static_contract(database: str, scripts: Sequence[Path], edition: str = "enterprise") -> dict[str, Any]:
+    base = validate_v501_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    required = migration_scripts_for_edition(v502_migration_scripts(database), edition)
+    missing = [name for name in required if name not in selected or not selected[name].is_file()]
+    invalid = {}
+    for name in v502_runtime_migration_scripts(database):
+        try:
+            facts = json.loads(selected[name].with_suffix(".schema.json").read_text(encoding="utf-8"))
+            failures = (validate_v502_approval_repair_manifest(facts) if name == V502_PG_APPROVAL_REPAIR_SCRIPT
+                        else validate_v502_schema_manifest(facts))
+            if failures:
+                invalid[name] = failures
+        except (KeyError, OSError, ValueError, TypeError):
+            invalid[name] = ["UNREADABLE_MANIFEST"]
+    control = {"scripts_missing": missing, "schema_manifests_invalid": invalid,
+               "passed": not missing and not invalid}
+    return {"database": database, "v501": base, "v502_model_processing_runtime": control,
+            "passed": bool(base.get("passed")) and control["passed"]}
+
+
+def validate_v503_static_contract(database: str, scripts: Sequence[Path], edition: str = 'enterprise') -> dict[str, Any]:
+    base = validate_v502_static_contract(database, scripts, edition)
+    selected = {path.name: path for path in scripts}
+    invalid = {}
+    for name in v503_runtime_migration_scripts(database):
+        try:
+            path = selected[name]
+            if not path.is_file():
+                raise OSError('Missing migration')
+            facts = json.loads(path.with_suffix('.schema.json').read_text())
+            if name == V503_ORACLE_COLLAB_SCRIPT:
+                try:
+                    from lib.oracle_collab_document import render
+                except ModuleNotFoundError:
+                    from shared.lib.oracle_collab_document import render
+                _,expected_sql,expected_facts=render()
+                if database!='oracle' or facts!=expected_facts or path.read_text()!=expected_sql:
+                    invalid[name]=['ORACLE_COLLAB_DOCUMENT_KEY_CONTRACT']
+                continue
+            if name == V503_TASK_TIMESTAMPS_SCRIPT:
+                try:
+                    from lib.task_step_timestamps import render
+                except ModuleNotFoundError:
+                    from shared.lib.task_step_timestamps import render
+                _, expected_sql, expected_facts = render(database)
+                if facts != expected_facts or path.read_text() != expected_sql:
+                    invalid[name] = ['TASK_STEP_TIMESTAMPS_CONTRACT']
+                continue
+            if name==V503_YASHAN_SEARCH_SCRIPT:
+                try:
+                    from lib.knowledge_native_governance import render_body_search
+                except ModuleNotFoundError:
+                    from shared.lib.knowledge_native_governance import render_body_search
+                _,expected_sql,expected_facts=render_body_search()
+                if facts!=expected_facts or path.read_text()!=expected_sql:
+                    invalid[name]=['NATIVE_BODY_SEARCH_CONTRACT']
+                continue
+            if name in {*V503_RUNTIME_MIGRATION_SCRIPTS[1:],V503_YASHAN_GUARD_SCRIPT}:
+                try:
+                    from lib.knowledge_native_governance import render
+                except ModuleNotFoundError:
+                    from shared.lib.knowledge_native_governance import render
+                _,expected_sql,expected_facts=render(database,authenticated_login=not name.startswith('112_'),legacy_shared=name.startswith('114_'),all_updates=name==V503_YASHAN_GUARD_SCRIPT)
+                if facts!=expected_facts or path.read_text()!=expected_sql:
+                    invalid[name]=['NATIVE_GOVERNANCE_CONTRACT']
+                continue
+            failures = validate_v502_schema_manifest(facts)
+            if set(facts) != {'CX_KNOWLEDGE_INTAKE'}:
+                failures.append('INTAKE_TABLE_SET')
+            if failures:
+                invalid[name] = failures
+        except (KeyError, OSError, ValueError, TypeError):
+            invalid[name] = ['UNREADABLE_MIGRATION_OR_MANIFEST']
+    return {'database': database, 'v502': base, 'v503_knowledge_intake': {'invalid': invalid, 'passed': not invalid},
+            'passed': bool(base.get('passed')) and not invalid}
+
+
+def _pg_runtime_permission_contract(cursor: Any) -> dict[str, Any]:
+    """Read actual PostgreSQL grants; absence of the runtime role is a failure."""
+    cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ai_agent_runtime')")
+    role_present = bool(_scalar(cursor.fetchone()))
+    if not role_present:
+        return {"role_present": False, "passed": False, "missing": ["role:ai_agent_runtime"]}
+    missing: list[str] = []
+    cursor.execute("SELECT has_schema_privilege('ai_agent_runtime', current_schema(), 'USAGE')")
+    if not bool(_scalar(cursor.fetchone())):
+        missing.append("schema:USAGE")
+    for table in sorted(V43_PG_RUNTIME_TABLES):
+        cursor.execute(
+            "SELECT has_table_privilege('ai_agent_runtime', current_schema() || '.' || %s, 'SELECT,INSERT,UPDATE,DELETE')",
+            (table.lower(),),
+        )
+        if not bool(_scalar(cursor.fetchone())):
+            missing.append(f"table:{table}:SELECT,INSERT,UPDATE,DELETE")
+    for table in sorted(V43_PG_THREAD_RUNTIME_TABLES):
+        cursor.execute(
+            "SELECT has_table_privilege('ai_agent_runtime', current_schema() || '.' || %s, 'SELECT,INSERT')",
+            (table.lower(),),
+        )
+        if not bool(_scalar(cursor.fetchone())):
+            missing.append(f"table:{table}:SELECT,INSERT")
+        cursor.execute(
+            "SELECT has_table_privilege('ai_agent_runtime', current_schema() || '.' || %s, 'UPDATE')",
+            (table.lower(),),
+        )
+        if bool(_scalar(cursor.fetchone())):
+            missing.append(f"table:{table}:UPDATE_REVOKED")
+        cursor.execute(
+            "SELECT has_table_privilege('ai_agent_runtime', current_schema() || '.' || %s, 'DELETE')",
+            (table.lower(),),
+        )
+        if bool(_scalar(cursor.fetchone())):
+            missing.append(f"table:{table}:DELETE_REVOKED")
+    return {"role_present": True, "passed": not missing, "missing": missing}
+
+
+def v43_catalog_snapshot(cursor: Any, database: str, *, include_permissions: bool = False) -> dict[str, Any]:
+    """Read v4.3 catalog facts without writing or changing session state."""
+    if database == "pg":
+        cursor.execute(
+            "SELECT upper(table_name) FROM information_schema.tables "
+            "WHERE table_schema = current_schema()"
+        )
+    else:
+        cursor.execute("SELECT TABLE_NAME FROM USER_TABLES")
+    tables = {str(row[0]).upper() for row in cursor.fetchall()}
+    columns: dict[str, set[str]] = {}
+    for table in tuple(dict.fromkeys(
+        V43_REQUIRED_TABLES + V434_COMPLIANCE_TABLES + V435_PLATFORM_TABLES
+        + V436_NATIVE_AGENT_TABLES + V437_BOOTSTRAP_TABLES + tuple(V437_BOOTSTRAP_REQUIRED_COLUMNS)
+        + V440_SDD_TABLES + V441_ADMIN_HA_TABLES + V442_GRAPH_OPERATIONS_TABLES + V443_SECURITY_DOMAIN_TABLES + V444_AGENT_POOL_TABLES
+        + tuple(V440_SDD_REQUIRED_COLUMNS) + tuple(V441_ADMIN_HA_REQUIRED_COLUMNS)
+        + tuple(V442_GRAPH_OPERATIONS_REQUIRED_COLUMNS) + tuple(V443_SECURITY_DOMAIN_REQUIRED_COLUMNS)
+        + tuple(V444_AGENT_POOL_REQUIRED_COLUMNS) + tuple(V445_GRAPH_RUN_REQUIRED_COLUMNS)
+        + tuple(V446_IDENTITY_PORTAL_GRAPH_REQUIRED_COLUMNS) + tuple(V411_RUNTIME_REQUIRED_COLUMNS)
+        + tuple(V452_TASK_CONTINUITY_REQUIRED_COLUMNS)
+    )):
+        if database == "pg":
+            cursor.execute(
+                "SELECT upper(column_name) FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND upper(table_name) = %s",
+                (table,),
+            )
+        else:
+            cursor.execute(
+                "SELECT upper(column_name) FROM user_tab_columns "
+                "WHERE upper(table_name) = :table_name", {"table_name": table},
+            )
+        columns[table] = {str(row[0]).upper() for row in cursor.fetchall()}
+
+    indexes: dict[str, dict[str, Any]] = {}
+    if database == "pg":
+        cursor.execute(
+            "SELECT upper(indexname), upper(tablename), indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema()"
+        )
+        for row in cursor.fetchall():
+            indexes[str(row[0]).upper()] = {
+                "table": str(row[1]).upper(),
+                "unique": str(row[2] or "").upper().startswith("CREATE UNIQUE INDEX"),
+            }
+    else:
+        cursor.execute("SELECT INDEX_NAME, TABLE_NAME, UNIQUENESS FROM USER_INDEXES")
+        for row in cursor.fetchall():
+            indexes[str(row[0]).upper()] = {
+                "table": str(row[1]).upper(),
+                "unique": _catalog_index_is_unique(row[2]),
+            }
+
+    snapshot: dict[str, Any] = {"tables": tables, "columns": columns, "indexes": indexes}
+    if database == "pg":
+        cursor.execute(
+            "SELECT upper(c.relname) FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = current_schema() AND c.relkind = 'r' AND c.relrowsecurity"
+        )
+        snapshot["rls_tables"] = {str(row[0]).upper() for row in cursor.fetchall()}
+        cursor.execute("SELECT upper(policyname) FROM pg_policies WHERE schemaname = current_schema()")
+        snapshot["policies"] = {str(row[0]).upper() for row in cursor.fetchall()}
+        if include_permissions:
+            permissions = _pg_runtime_permission_contract(cursor)
+            snapshot["permission_contract_passed"] = permissions["passed"]
+            snapshot["missing_privileges"] = permissions["missing"]
+            snapshot["runtime_role_present"] = permissions["role_present"]
+    else:
+        snapshot["permission_contract_passed"] = True
+    return snapshot
+
+
+@dataclass
+class ProbeResult:
+    database: str
+    connected: bool
+    product: str = ""
+    version: str = ""
+    core_tables_present: int = 0
+    core_tables_required: int = len(CORE_TABLES)
+    v401_tables_present: int = 0
+    v401_tables_required: int = len(V401_TABLES)
+    v401_tables_missing: list[str] = field(default_factory=list)
+    registration_tables_present: int = 0
+    registration_tables_required: int = len(REGISTRATION_TABLES)
+    registration_tables_missing: list[str] = field(default_factory=list)
+    governance_tables_present: int = 0
+    governance_tables_required: int = len(GOVERNANCE_TABLES)
+    governance_tables_missing: list[str] = field(default_factory=list)
+    graph_tables_present: int = 0
+    graph_tables_required: int = len(GRAPH_TABLES)
+    graph_tables_missing: list[str] = field(default_factory=list)
+    skill_entity_contract: bool = False
+    oracle_text_contract: dict[str, Any] = field(default_factory=dict)
+    v43_schema_contract: dict[str, Any] = field(default_factory=dict)
+    v43_partial_schema: list[dict[str, Any]] = field(default_factory=list)
+    v431_organization_contract: dict[str, Any] = field(default_factory=dict)
+    v434_compliance_contract: dict[str, Any] = field(default_factory=dict)
+    v435_platform_contract: dict[str, Any] = field(default_factory=dict)
+    v436_native_agent_contract: dict[str, Any] = field(default_factory=dict)
+    v437_bootstrap_embedding_contract: dict[str, Any] = field(default_factory=dict)
+    v442_graph_operations_contract: dict[str, Any] = field(default_factory=dict)
+    v443_security_domain_binding_contract: dict[str, Any] = field(default_factory=dict)
+    v444_agent_pool_contract: dict[str, Any] = field(default_factory=dict)
+    v445_graph_run_contract: dict[str, Any] = field(default_factory=dict)
+    v446_identity_portal_graph_contract: dict[str, Any] = field(default_factory=dict)
+    v410_model_usage_wallboard_contract: dict[str, Any] = field(default_factory=dict)
+    v411_runtime_isolation_db4a2a_contract: dict[str, Any] = field(default_factory=dict)
+    v452_task_continuity_contract: dict[str, Any] = field(default_factory=dict)
+    v500_source_ip_access_contract: dict[str, Any] = field(default_factory=dict)
+    v501_memory_context_quality_contract: dict[str, Any] = field(default_factory=dict)
+    v502_model_processing_runtime_contract: dict[str, Any] = field(default_factory=dict)
+    error_type: str = ""
+
+
+def _capture_v501_migrations(cursor: Any, database: str, target_version: str,
+                             names: Sequence[str]) -> dict[str, Any]:
+    """Verify release migration ledgers and live objects for the selected package."""
+    try:
+        import migration_runner as runner
+    except ImportError:
+        try:
+            from shared import migration_runner as runner
+        except ImportError as exc:
+            return {"passed": False, "error": type(exc).__name__, "steps": {}}
+
+    steps: dict[str, dict[str, Any]] = {}
+    for name in names:
+        path = _migration_path(database, name)
+        versions = [target_version]
+        if name == "102_v5_0_0_network_access.sql" and target_version in {"5.0.1", "5.0.2"}:
+            if target_version == "5.0.2":
+                versions.append("5.0.1")
+            versions.append("5.0.0")
+        if target_version == "5.0.2" and name in V501_MIGRATION_SCRIPTS[-3:]:
+            versions.append("5.0.1")
+        observation = None
+        for version in dict.fromkeys(versions):
+            try:
+                row = runner._step_row(cursor, database, path, version=version)
+            except Exception:
+                observation = {"version": version, "ledger_status": "UNREADABLE",
+                               "checksum_matches": False}
+                break
+            if row is not None:
+                observation = {"version": version, "ledger_status": row["status"],
+                               "checksum_matches": row["checksum"] == runner._checksum(path)}
+                break
+        try:
+            objects_complete = bool(path.is_file() and runner._step_objects_complete(
+                cursor, database, path, version=target_version))
+        except Exception:
+            objects_complete = False
+        ledger_complete = bool(observation and observation["ledger_status"] == "APPLIED"
+                               and observation["checksum_matches"])
+        steps[name] = {**(observation or {"version": "", "ledger_status": "MISSING",
+                                          "checksum_matches": False}),
+                       "objects_complete": objects_complete,
+                       "passed": ledger_complete and objects_complete}
+    return {"steps": steps, "passed": bool(steps) and all(item["passed"] for item in steps.values())}
+
+
+def _capture_v43_catalog(cursor: Any, database: str, result: ProbeResult,
+                         target_version: str = "4.3.0") -> None:
+    """Attach the read-only v4.3 catalog contract to a live probe result."""
+    snapshot = v43_catalog_snapshot(cursor, database, include_permissions=database == "pg")
+    result.v43_schema_contract = validate_v43_catalog_snapshot(
+        database, snapshot, require_runtime_permissions=database == "pg",
+    )
+    result.v43_partial_schema = v43_partial_schema_incomplete(snapshot)
+    result.v410_model_usage_wallboard_contract = {
+        "tables_missing": sorted(set(V410_MODEL_TABLES) - set(snapshot["tables"])),
+    }
+    result.v410_model_usage_wallboard_contract["passed"] = not result.v410_model_usage_wallboard_contract["tables_missing"]
+    result.v411_runtime_isolation_db4a2a_contract = {
+        "tables_missing": sorted(set(V411_RUNTIME_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V411_RUNTIME_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v411_runtime_isolation_db4a2a_contract["passed"] = not any((
+        result.v411_runtime_isolation_db4a2a_contract["tables_missing"],
+        result.v411_runtime_isolation_db4a2a_contract["columns_missing"],
+    ))
+    result.v452_task_continuity_contract = {
+        "tables_missing": sorted(set(V452_TASK_CONTINUITY_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V452_TASK_CONTINUITY_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v452_task_continuity_contract["passed"] = not any((
+        result.v452_task_continuity_contract["tables_missing"],
+        result.v452_task_continuity_contract["columns_missing"],
+    ))
+    try:
+        release_tuple = tuple(int(part) for part in target_version.split(".")[:3])
+    except ValueError:
+        release_tuple = (0, 0, 0)
+    if release_tuple >= (5, 0, 0):
+        result.v500_source_ip_access_contract = _capture_v501_migrations(
+            cursor, database, target_version, ("102_v5_0_0_network_access.sql",))
+    if release_tuple >= (5, 0, 1):
+        result.v501_memory_context_quality_contract = _capture_v501_migrations(
+            cursor, database, target_version,
+            ("103_v5_0_1_memory_quality.sql", "104_v5_0_1_context_assets.sql",
+             "105_v5_0_1_answer_quality.sql"))
+    if release_tuple >= (5, 0, 2):
+        result.v502_model_processing_runtime_contract = _capture_v501_migrations(
+            cursor, database, target_version, v502_native_migration_scripts(database))
+    result.v431_organization_contract = _capture_v431_organization(cursor, database)
+    result.v434_compliance_contract = {
+        "tables_missing": sorted(set(V434_COMPLIANCE_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V434_COMPLIANCE_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v434_compliance_contract["passed"] = not any((
+        result.v434_compliance_contract["tables_missing"], result.v434_compliance_contract["columns_missing"],
+    ))
+    result.v435_platform_contract = {
+        "tables_missing": sorted(set(V435_PLATFORM_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V435_PLATFORM_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v435_platform_contract["passed"] = not any((
+        result.v435_platform_contract["tables_missing"], result.v435_platform_contract["columns_missing"],
+    ))
+    result.v436_native_agent_contract = {
+        "tables_missing": sorted(set(V436_NATIVE_AGENT_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V436_NATIVE_AGENT_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v436_native_agent_contract["passed"] = not any((
+        result.v436_native_agent_contract["tables_missing"], result.v436_native_agent_contract["columns_missing"],
+    ))
+    result.v437_bootstrap_embedding_contract = {
+        "tables_missing": sorted(set(V437_BOOTSTRAP_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V437_BOOTSTRAP_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v437_bootstrap_embedding_contract["passed"] = not any((
+        result.v437_bootstrap_embedding_contract["tables_missing"], result.v437_bootstrap_embedding_contract["columns_missing"],
+    ))
+    result.v442_graph_operations_contract = {
+        "tables_missing": sorted(set(V442_GRAPH_OPERATIONS_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V442_GRAPH_OPERATIONS_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v442_graph_operations_contract["passed"] = not any((
+        result.v442_graph_operations_contract["tables_missing"],
+        result.v442_graph_operations_contract["columns_missing"],
+    ))
+    result.v443_security_domain_binding_contract = {
+        "tables_missing": sorted(set(V443_SECURITY_DOMAIN_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V443_SECURITY_DOMAIN_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v443_security_domain_binding_contract["passed"] = not any((
+        result.v443_security_domain_binding_contract["tables_missing"],
+        result.v443_security_domain_binding_contract["columns_missing"],
+    ))
+    result.v444_agent_pool_contract = {
+        "tables_missing": sorted(set(V444_AGENT_POOL_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V444_AGENT_POOL_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v444_agent_pool_contract["passed"] = not any((
+        result.v444_agent_pool_contract["tables_missing"], result.v444_agent_pool_contract["columns_missing"],
+    ))
+    result.v445_graph_run_contract = {
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V445_GRAPH_RUN_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v445_graph_run_contract["passed"] = not result.v445_graph_run_contract["columns_missing"]
+    result.v446_identity_portal_graph_contract = {
+        "tables_missing": sorted(set(V446_IDENTITY_PORTAL_GRAPH_TABLES) - set(snapshot["tables"])),
+        "columns_missing": {
+            table: sorted(set(required) - set(snapshot["columns"].get(table, set())))
+            for table, required in V446_IDENTITY_PORTAL_GRAPH_REQUIRED_COLUMNS.items()
+            if set(required) - set(snapshot["columns"].get(table, set()))
+        },
+    }
+    result.v446_identity_portal_graph_contract["passed"] = not any((
+        result.v446_identity_portal_graph_contract["tables_missing"],
+        result.v446_identity_portal_graph_contract["columns_missing"],
+    ))
+
+
+def _capture_v431_organization(cursor: Any, database: str) -> dict[str, Any]:
+    """Read and validate the additive organization catalog without mutation."""
+    if database == "pg":
+        cursor.execute(
+            "SELECT upper(table_name) FROM information_schema.tables "
+            "WHERE table_schema = current_schema()"
+        )
+    else:
+        cursor.execute("SELECT TABLE_NAME FROM USER_TABLES")
+    tables = {str(row[0]).upper() for row in cursor.fetchall()}
+    columns: dict[str, set[str]] = {}
+    for table in V431_ORGANIZATION_REQUIRED_COLUMNS:
+        if database == "pg":
+            cursor.execute(
+                "SELECT upper(column_name) FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND upper(table_name) = %s",
+                (table,),
+            )
+        else:
+            cursor.execute(
+                "SELECT upper(column_name) FROM user_tab_columns "
+                "WHERE upper(table_name) = :table_name", {"table_name": table},
+            )
+        columns[table] = {str(row[0]).upper() for row in cursor.fetchall()}
+    if database == "pg":
+        cursor.execute(
+            "SELECT upper(indexname), upper(tablename), indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema()"
+        )
+        indexes = {
+            str(row[0]).upper(): {
+                "table": str(row[1]).upper(),
+                "unique": str(row[2] or "").upper().startswith("CREATE UNIQUE INDEX"),
+            }
+            for row in cursor.fetchall()
+        }
+    else:
+        cursor.execute("SELECT INDEX_NAME, TABLE_NAME, UNIQUENESS FROM USER_INDEXES")
+        indexes = {
+            str(row[0]).upper(): {
+                "table": str(row[1]).upper(),
+                "unique": _catalog_index_is_unique(row[2]),
+            }
+            for row in cursor.fetchall()
+        }
+    missing_tables = sorted(set(V431_ORGANIZATION_TABLES) - tables)
+    missing_columns = {
+        table: sorted(set(required) - columns.get(table, set()))
+        for table, required in V431_ORGANIZATION_REQUIRED_COLUMNS.items()
+        if set(required) - columns.get(table, set())
+    }
+    missing_indexes = sorted(
+        name for name, (table, unique) in V431_INDEX_CONTRACT.items()
+        if name not in indexes
+        or indexes[name]["table"] != table
+        or (unique and not indexes[name]["unique"])
+    )
+    return {
+        "tables_missing": missing_tables,
+        "columns_missing": missing_columns,
+        "indexes_missing": missing_indexes,
+        "passed": not any((missing_tables, missing_columns, missing_indexes)),
+    }
+
+
+def _load_database_config(path: Path) -> dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = dict(raw.get("database") or {})
+    encrypted = section.pop("_encrypted", None)
+    section.pop("_key_source", None)
+    if encrypted:
+        try:
+            from shared.lib.connection_crypto import decrypt_section, get_master_key
+        except ImportError:  # Generated packages place the shared library under scripts/.
+            from lib.connection_crypto import decrypt_section, get_master_key
+        section.update(decrypt_section(encrypted, get_master_key()))
+    return section
+
+
+def _scalar(row: Any) -> Any:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return next(iter(row.values()), None)
+    return row[0]
+
+
+def _probe_oracle(config: dict[str, Any], *, enterprise: bool = True,
+                  target_version: str = "4.3.0") -> ProbeResult:
+    import oracledb
+
+    result = ProbeResult(database="oracle", connected=False, product="Oracle AI Database")
+    conn = oracledb.connect(
+        user=config["user"], password=config["password"], dsn=config["dsn"],
+        tcp_connect_timeout=8,
+    )
+    try:
+        result.connected = True
+        with conn.cursor() as cursor:
+            try:
+                cursor.execute("SELECT banner FROM v$version FETCH FIRST 1 ROW ONLY")
+                banner = str(_scalar(cursor.fetchone()) or "")
+                result.version = banner[:32]
+            except Exception:
+                result.version = "unavailable"
+            names = CORE_TABLES + V401_TABLES + REGISTRATION_TABLES + GOVERNANCE_TABLES + GRAPH_TABLES
+            binds = ",".join(f":n{i}" for i in range(len(names)))
+            cursor.execute(
+                f"SELECT table_name FROM user_tables WHERE table_name IN ({binds})",
+                {f"n{i}": name for i, name in enumerate(names)},
+            )
+            present = {str(row[0]).upper() for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT column_name FROM user_tab_columns WHERE table_name = 'SKILL_META'"
+            )
+            skill_columns = {str(row[0]).upper() for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT COUNT(*) FROM CTXSYS.CTX_PREFERENCES "
+                "WHERE PRE_OWNER = USER AND PRE_NAME = 'ENTITIES_MCD'"
+            )
+            preference_present = int(_scalar(cursor.fetchone()) or 0) == 1
+            cursor.execute(
+                "SELECT DOMIDX_STATUS, DOMIDX_OPSTATUS FROM USER_INDEXES "
+                "WHERE INDEX_NAME = 'ENTITIES_SEARCH_CTX'"
+            )
+            index_row = cursor.fetchone()
+            index_status = tuple(str(value or "").upper() for value in index_row) if index_row else ()
+            result.oracle_text_contract = {
+                "preference_present": preference_present,
+                "index_present": bool(index_row),
+                "domidx_status": index_status[0] if len(index_status) > 0 else "",
+                "domidx_opstatus": index_status[1] if len(index_status) > 1 else "",
+                "passed": preference_present and index_status == ("VALID", "VALID"),
+            }
+            _capture_v43_catalog(cursor, "oracle", result, target_version)
+        result.core_tables_present = len(present.intersection(CORE_TABLES))
+        result.v401_tables_present = len(present.intersection(V401_TABLES))
+        result.v401_tables_missing = sorted(set(V401_TABLES) - present)
+        result.registration_tables_present = len(present.intersection(REGISTRATION_TABLES))
+        result.registration_tables_missing = sorted(set(REGISTRATION_TABLES) - present)
+        result.governance_tables_required = len(GOVERNANCE_TABLES) if enterprise else 0
+        result.governance_tables_present = len(present.intersection(GOVERNANCE_TABLES))
+        result.governance_tables_missing = sorted(set(GOVERNANCE_TABLES) - present) if enterprise else []
+        result.graph_tables_present = len(present.intersection(GRAPH_TABLES))
+        result.graph_tables_missing = sorted(set(GRAPH_TABLES) - present)
+        result.skill_entity_contract = {"ENTITY_ID", "ENTITY_TYPE", "SKILL_NAME"} <= skill_columns
+        if not result.oracle_text_contract:
+            result.oracle_text_contract = {"passed": False, "error": "not-probed"}
+        return result
+    finally:
+        conn.close()
+
+
+def _probe_pg(config: dict[str, Any], *, enterprise: bool = True,
+              target_version: str = "4.3.0") -> ProbeResult:
+    import psycopg2
+
+    result = ProbeResult(database="pg", connected=False, product="PostgreSQL")
+    conn = psycopg2.connect(
+        user=config["user"], password=config.get("password"), host=config["host"],
+        port=int(config.get("port", 5432)), dbname=config["dbname"],
+        connect_timeout=8,
+    )
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        result.connected = True
+        with conn.cursor() as cursor:
+            cursor.execute("SHOW server_version")
+            result.version = str(_scalar(cursor.fetchone()) or "")[:32]
+            cursor.execute(
+                "SELECT upper(table_name) FROM information_schema.tables "
+                "WHERE table_schema = current_schema()"
+            )
+            present = {str(row[0]).upper() for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT upper(column_name) FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'skill_meta'"
+            )
+            skill_columns = {str(row[0]).upper() for row in cursor.fetchall()}
+            _capture_v43_catalog(cursor, "pg", result, target_version)
+        conn.rollback()
+        result.core_tables_present = len(present.intersection(CORE_TABLES))
+        result.v401_tables_present = len(present.intersection(V401_TABLES))
+        result.v401_tables_missing = sorted(set(V401_TABLES) - present)
+        result.registration_tables_present = len(present.intersection(REGISTRATION_TABLES))
+        result.registration_tables_missing = sorted(set(REGISTRATION_TABLES) - present)
+        result.governance_tables_required = len(GOVERNANCE_TABLES) if enterprise else 0
+        result.governance_tables_present = len(present.intersection(GOVERNANCE_TABLES))
+        result.governance_tables_missing = sorted(set(GOVERNANCE_TABLES) - present) if enterprise else []
+        result.graph_tables_present = len(present.intersection(GRAPH_TABLES))
+        result.graph_tables_missing = sorted(set(GRAPH_TABLES) - present)
+        result.skill_entity_contract = {"ENTITY_ID", "ENTITY_TYPE", "SKILL_NAME"} <= skill_columns
+        return result
+    finally:
+        conn.close()
+
+
+def _probe_yashandb(config: dict[str, Any], *, enterprise: bool = True,
+                    target_version: str = "4.3.0") -> ProbeResult:
+    import yaspy
+
+    result = ProbeResult(database="yashandb", connected=False, product="YashanDB")
+    conn = yaspy.Connection(
+        user=config["user"], password=config["password"], dsn=config["dsn"]
+    )
+    try:
+        result.connected = True
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT VERSION_NUMBER FROM V$VERSION")
+            result.version = str(_scalar(cursor.fetchone()) or "")[:32]
+            names = CORE_TABLES + V401_TABLES + REGISTRATION_TABLES + GOVERNANCE_TABLES + GRAPH_TABLES
+            binds = ",".join(f":n{i}" for i in range(len(names)))
+            cursor.execute(
+                f"SELECT TABLE_NAME FROM USER_TABLES WHERE TABLE_NAME IN ({binds})",
+                {f"n{i}": name for i, name in enumerate(names)},
+            )
+            present = {str(row[0]).upper() for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = 'SKILL_META'"
+            )
+            skill_columns = {str(row[0]).upper() for row in cursor.fetchall()}
+            _capture_v43_catalog(cursor, "yashandb", result, target_version)
+        result.core_tables_present = len(present.intersection(CORE_TABLES))
+        result.v401_tables_present = len(present.intersection(V401_TABLES))
+        result.v401_tables_missing = sorted(set(V401_TABLES) - present)
+        result.registration_tables_present = len(present.intersection(REGISTRATION_TABLES))
+        result.registration_tables_missing = sorted(set(REGISTRATION_TABLES) - present)
+        result.governance_tables_required = len(GOVERNANCE_TABLES) if enterprise else 0
+        result.governance_tables_present = len(present.intersection(GOVERNANCE_TABLES))
+        result.governance_tables_missing = sorted(set(GOVERNANCE_TABLES) - present) if enterprise else []
+        result.graph_tables_present = len(present.intersection(GRAPH_TABLES))
+        result.graph_tables_missing = sorted(set(GRAPH_TABLES) - present)
+        result.skill_entity_contract = {"ENTITY_ID", "ENTITY_TYPE", "SKILL_NAME"} <= skill_columns
+        return result
+    finally:
+        conn.close()
+
+
+PROBES = {"oracle": _probe_oracle, "pg": _probe_pg, "yashandb": _probe_yashandb}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--oracle-config", type=Path)
+    parser.add_argument("--pg-config", type=Path)
+    parser.add_argument("--yashandb-config", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--version", default="", help="release version represented by this evidence")
+    parser.add_argument("--edition", choices=("community", "enterprise"),
+                        help="edition contract; defaults to the package manifest or enterprise")
+    args = parser.parse_args()
+
+    paths = {
+        "oracle": args.oracle_config,
+        "pg": args.pg_config,
+        "yashandb": args.yashandb_config,
+    }
+    available_databases = _available_databases()
+    manifest_path = REPO_ROOT / "build-manifest.json"
+    manifest_edition = ""
+    if manifest_path.is_file():
+        try:
+            manifest_edition = str(json.loads(manifest_path.read_text(encoding="ascii")).get("edition") or "").lower()
+        except (OSError, ValueError):
+            manifest_edition = ""
+    edition = args.edition or manifest_edition or "enterprise"
+    enterprise = edition == "enterprise"
+    results: list[ProbeResult] = []
+    if args.version:
+        target_version = args.version
+    else:
+        manifest_path = REPO_ROOT / "build-manifest.json"
+        version_path = REPO_ROOT / "VERSION"
+        if manifest_path.is_file():
+            target_version = str(json.loads(manifest_path.read_text(encoding="ascii")).get("version") or "unknown")
+        elif version_path.is_file():
+            target_version = version_path.read_text(encoding="ascii").strip()
+        else:
+            target_version = "unknown"
+    # v4.3.0 integrates the internal v4.2.1 Graph closure.  Its live schema
+    # gate therefore has the same mandatory Graph object contract as the
+    # v4.2.x experimental line; otherwise an incomplete v4.3.0 deployment
+    # could be reported as ready.
+    try:
+        target_tuple = tuple(int(part) for part in target_version.split(".")[:3])
+    except ValueError:
+        target_tuple = (0, 0, 0)
+    at_least = lambda version: target_tuple >= version
+    requires_graph = at_least((4, 2, 0))
+    requires_v43 = at_least((4, 3, 0))
+    requires_v431 = at_least((4, 3, 1))
+    requires_v432 = at_least((4, 3, 2))
+    requires_v433 = at_least((4, 3, 3))
+    requires_v434 = at_least((4, 3, 4))
+    requires_v435 = at_least((4, 3, 5))
+    requires_v436 = at_least((4, 3, 6))
+    requires_v437 = at_least((4, 3, 7))
+    requires_v440 = at_least((4, 4, 0))
+    requires_v441 = at_least((4, 4, 1))
+    requires_v442 = at_least((4, 4, 2))
+    requires_v443 = at_least((4, 4, 3))
+    requires_v444 = at_least((4, 4, 4))
+    requires_v445 = at_least((4, 4, 5))
+    requires_v446 = at_least((4, 4, 6))
+    requires_v448 = target_version.startswith("4.4.8")
+    requires_v449 = target_version.startswith("4.4.9")
+    requires_v410 = at_least((4, 4, 10))
+    requires_v411 = at_least((4, 4, 11))
+    requires_v452 = at_least((4, 5, 2))
+    requires_v500 = at_least((5, 0, 0))
+    requires_v501 = at_least((5, 0, 1))
+    requires_v502 = at_least((5, 0, 2))
+    static_contracts: dict[str, dict[str, Any]] = {}
+    if requires_v43:
+        for database in available_databases:
+            if at_least((5, 0, 4)):
+                migration_scripts = migration_scripts_for_edition(v504_migration_scripts(database), edition)
+                validator = lambda database, scripts: validate_v504_static_contract(database, scripts, edition)
+            elif at_least((5, 0, 3)):
+                migration_scripts = migration_scripts_for_edition(v503_migration_scripts(database), edition)
+                validator = lambda database, scripts: validate_v503_static_contract(database, scripts, edition)
+            elif requires_v502:
+                migration_scripts = migration_scripts_for_edition(v502_migration_scripts(database), edition)
+                validator = lambda database, scripts: validate_v502_static_contract(database, scripts, edition)
+            elif at_least((5, 0, 1)):
+                migration_scripts = migration_scripts_for_edition(V501_MIGRATION_SCRIPTS, edition)
+                validator = lambda database, scripts: validate_v501_static_contract(database, scripts, edition)
+            elif at_least((5, 0, 0)):
+                migration_scripts = migration_scripts_for_edition(V500_MIGRATION_SCRIPTS, edition)
+                validator = lambda database, scripts: validate_v500_static_contract(database, scripts, edition)
+            elif requires_v452:
+                migration_scripts = migration_scripts_for_edition(V452_MIGRATION_SCRIPTS, edition)
+                validator = lambda database, scripts: validate_v452_static_contract(database, scripts, edition)
+            elif requires_v411:
+                migration_scripts = migration_scripts_for_edition(V411_MIGRATION_SCRIPTS, edition)
+                validator = lambda database, scripts: validate_v411_static_contract(database, scripts, edition)
+            elif requires_v410:
+                migration_scripts = migration_scripts_for_edition(V410_MIGRATION_SCRIPTS, edition)
+                validator = lambda database, scripts: validate_v410_static_contract(database, scripts, edition)
+            elif requires_v449:
+                migration_scripts = migration_scripts_for_edition(V449_MIGRATION_SCRIPTS, edition)
+                validator = lambda database, scripts: validate_v449_static_contract(database, scripts, edition)
+            elif requires_v448:
+                migration_scripts, validator = V448_MIGRATION_SCRIPTS, validate_v448_static_contract
+            elif requires_v446:
+                migration_scripts, validator = V446_MIGRATION_SCRIPTS, validate_v446_static_contract
+            elif requires_v445:
+                migration_scripts, validator = V445_MIGRATION_SCRIPTS, validate_v445_static_contract
+            elif requires_v444:
+                migration_scripts, validator = V444_MIGRATION_SCRIPTS, validate_v444_static_contract
+            elif requires_v443:
+                migration_scripts, validator = V443_MIGRATION_SCRIPTS, validate_v443_static_contract
+            elif requires_v442:
+                migration_scripts, validator = V442_MIGRATION_SCRIPTS, validate_v442_static_contract
+            elif requires_v441:
+                migration_scripts, validator = V441_MIGRATION_SCRIPTS, validate_v441_static_contract
+            elif requires_v440:
+                migration_scripts, validator = V440_MIGRATION_SCRIPTS, validate_v440_static_contract
+            elif requires_v437:
+                migration_scripts, validator = V437_MIGRATION_SCRIPTS, validate_v437_static_contract
+            elif requires_v436:
+                migration_scripts, validator = V436_MIGRATION_SCRIPTS, validate_v436_static_contract
+            elif requires_v435:
+                migration_scripts, validator = V435_MIGRATION_SCRIPTS, validate_v435_static_contract
+            elif requires_v434:
+                migration_scripts, validator = V434_MIGRATION_SCRIPTS, validate_v434_static_contract
+            elif requires_v433:
+                migration_scripts, validator = V433_MIGRATION_SCRIPTS, validate_v433_static_contract
+            elif requires_v432:
+                migration_scripts, validator = V432_MIGRATION_SCRIPTS, validate_v432_static_contract
+            elif requires_v431:
+                migration_scripts, validator = V431_MIGRATION_SCRIPTS, validate_v431_static_contract
+            else:
+                migration_scripts, validator = V43_MIGRATION_SCRIPTS, validate_v43_static_contract
+            scripts = [_migration_path(database, name) for name in migration_scripts]
+            if database == "pg" and (requires_v449 or requires_v410) and "51_v4_4_9_identity_boundary_repair.sql" not in migration_scripts:
+                scripts.append(_migration_path("pg", "51_v4_4_9_identity_boundary_repair.sql"))
+                scripts.append(_migration_path("pg", "53_v4_4_9_pg_runtime_boundary.sql"))
+            elif database == "pg" and "49_v4_4_8_security_domain_rls.sql" not in migration_scripts:
+                scripts.append(_migration_path("pg", "49_v4_4_8_security_domain_rls.sql"))
+            static_contracts[database] = validator(database, scripts)
+    # v4.3 replaced the pre-v4.3 execution/registration/governance catalog
+    # with the CX control-plane catalog. Keep the legacy checks for older
+    # releases, but do not make a valid v4.3+ deployment fail on objects that
+    # are no longer part of its schema contract.
+    legacy_catalog_required = not requires_v43
+    for database in available_databases:
+        path = paths[database]
+        if path is None:
+            parser.error(f"--{database}-config is required for {database}")
+        try:
+            result = PROBES[database](_load_database_config(path), enterprise=enterprise,
+                                      target_version=target_version)
+            if not legacy_catalog_required:
+                result.v401_tables_required = 0
+                result.v401_tables_missing = []
+                result.registration_tables_required = 0
+                result.registration_tables_missing = []
+                result.governance_tables_required = 0
+                result.governance_tables_missing = []
+                result.skill_entity_contract = True
+            results.append(result)
+        except Exception as exc:
+            results.append(ProbeResult(
+                database=database, connected=False, product=database,
+                governance_tables_required=(len(GOVERNANCE_TABLES) if enterprise else 0) if legacy_catalog_required else 0,
+                error_type=type(exc).__name__,
+            ))
+
+    payload = {
+        "schema": "ai-agent-infra-live-probe/v1",
+        "version": target_version,
+        "edition": edition.title(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "config_fingerprints": {
+            database: hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+            for database, path in paths.items()
+            if database in available_databases and path is not None
+        },
+        "results": [asdict(result) for result in results],
+        "passed": all(
+            result.connected
+            and result.core_tables_present == result.core_tables_required
+            and (not legacy_catalog_required or result.v401_tables_present == result.v401_tables_required)
+            and (not legacy_catalog_required or result.registration_tables_present == result.registration_tables_required)
+            and (not legacy_catalog_required or result.governance_tables_present >= result.governance_tables_required)
+            and (not requires_graph or (
+                result.graph_tables_present == result.graph_tables_required
+                and not result.graph_tables_missing
+            ))
+            and (not requires_v43 or (
+                result.v43_schema_contract.get("passed") is True
+                and (not requires_v434 or not enterprise or result.v434_compliance_contract.get("passed") is True)
+                and (not requires_v435 or result.v435_platform_contract.get("passed") is True)
+                and (not requires_v436 or result.v436_native_agent_contract.get("passed") is True)
+                and (not requires_v437 or result.v437_bootstrap_embedding_contract.get("passed") is True)
+                and (not requires_v442 or result.v442_graph_operations_contract.get("passed") is True)
+                and (not requires_v443 or result.v443_security_domain_binding_contract.get("passed") is True)
+                and (not requires_v444 or result.v444_agent_pool_contract.get("passed") is True)
+                and (not requires_v445 or result.v445_graph_run_contract.get("passed") is True)
+                and (not requires_v446 or result.v446_identity_portal_graph_contract.get("passed") is True)
+                and (not requires_v410 or result.v410_model_usage_wallboard_contract.get("passed") is True)
+                and (not requires_v411 or result.v411_runtime_isolation_db4a2a_contract.get("passed") is True)
+                and (not requires_v452 or result.v452_task_continuity_contract.get("passed") is True)
+                and (not requires_v500 or result.v500_source_ip_access_contract.get("passed") is True)
+                and (not requires_v501 or result.v501_memory_context_quality_contract.get("passed") is True)
+                and (not requires_v502 or result.v502_model_processing_runtime_contract.get("passed") is True)
+                and not result.v43_partial_schema
+            ))
+            and (not requires_v431 or result.v431_organization_contract.get("passed") is True)
+            and (not legacy_catalog_required or result.skill_entity_contract)
+            and (result.database != "oracle" or result.oracle_text_contract.get("passed") is True)
+            and (not requires_v43 or static_contracts.get(result.database, {}).get("passed") is True)
+            for result in results
+        ),
+        "v43_static_contracts": static_contracts,
+    }
+    rendered = json.dumps(payload, indent=2, ensure_ascii=True) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="ascii")
+    print(rendered, end="")
+    return 0 if payload["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

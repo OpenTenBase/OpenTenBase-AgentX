@@ -1,0 +1,21 @@
+{
+  "name": "chuanxu-web",
+  "private": true,
+  "version": "5.0.1",
+  "scripts": {
+    "build": "NODE_OPTIONS=--require=./rollup-wasm-hook.cjs vite build"
+  },
+  "dependencies": {
+    "lucide-react": "0.468.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@rollup/wasm-node": "4.62.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.2",
+    "vite": "7.3.7"
+  }
+}

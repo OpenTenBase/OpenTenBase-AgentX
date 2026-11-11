@@ -1,4 +1,4 @@
-# Deployment guide v5.0.4
+# Deployment guide v5.0.5
 
 > Installed product: **OpenTenBase AgentX**; supported backends: **pg**; edition: **Community**; license: **Apache-2.0**. Other backends and Enterprise-only capabilities discussed below describe differences; they do not extend this package's scope.
 
@@ -77,6 +77,12 @@ chain extends migration 102 with `103_v5_0_1_memory_quality.sql`,
 its own structure manifest. Historical SQL and applied checksums keep their
 original identities.
 
+For v5.0.5, continue through 106–114, 117, 120, 119 and 121. The current
+PostgreSQL terminal is **121**; 120 is the prerequisite executed before 119.
+Verify 121's native own-context reads and other/forged/write denials, along with
+the complete historical chain. See [migration](migration.md) for the explicit
+v5.0.4 upgrade; historical introduction scripts are not the current terminal.
+
 Postflight verifies the actual time/note/retrospective, context/asset/source and
 answer-quality structures, APPLIED entries and script digests. A terminal 105
 ledger row cannot substitute for missing 103 or 104 objects. Existing data,
@@ -89,7 +95,7 @@ file with mode `0600` or stricter, then run from the package root:
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_platform.sh initialize \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config "$CX_CONFIG_PATH" \
   --admin-password-file /absolute/path/admin.password
 ```
@@ -117,7 +123,7 @@ They must not enter public archives.
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_platform.sh verify \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config "$CX_CONFIG_PATH"
 ./start_web_server.sh start
 ./start_web_server.sh status

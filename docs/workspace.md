@@ -1,4 +1,4 @@
-# Workspace and context continuity v5.0.4
+# Workspace and context continuity v5.0.5
 
 > Installed product: **OpenTenBase AgentX**; supported backends: **pg**; edition: **Community**; license: **Apache-2.0**. Other backends and Enterprise-only capabilities discussed below describe differences; they do not extend this package's scope.
 

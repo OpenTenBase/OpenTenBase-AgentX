@@ -1,4 +1,4 @@
-# Migration guide v5.0.4
+# Migration guide v5.0.5
 
 > Installed product: **OpenTenBase AgentX**; supported backends: **pg**; edition: **Community**; license: **Apache-2.0**. Other backends and Enterprise-only capabilities discussed below describe differences; they do not extend this package's scope.
 
@@ -14,13 +14,21 @@ v5.0.0 adds `102_v5_0_0_network_access.sql` for source IP policy entities.
 v5.0.1 adds 103–105 for memory quality, context assets and final-answer
 evaluation. v5.0.2 adds 106–110, including the historical approval-constraint
 repair in 110. v5.0.3 preserves that chain and adds **111–114, then 117**.
-Verify each selected script and schema manifest; terminal 117 alone is not
+Verify each selected script and schema manifest; a historical terminal alone is not
 evidence of database or release acceptance.
 
 Migration 111 stores guided intake metadata; 112–114 enforce native Knowledge
 write guards. Migration 117 adds nullable Task Step start/completion timestamps
 without a default or historical backfill. Existing rows, grants and unknown
 times remain unchanged. A missing historical time does not prove a step never ran.
+
+v5.0.4 adds STATUSPAGE Source kind migration 119 and prerequisite 120, which
+repairs only the exact supported historical Source constraints before unchanged
+119 executes. v5.0.5 appends `121_v5_0_5_pg_context_self_read.sql`, restoring
+ACTIVE Agents' own-context reads through their registered native identity.
+The current PostgreSQL terminal is **121**. Verify own/other/forged/write
+controls; no shared-context or write grant is added. Use `--from-version 5.0.4`
+for the current upgrade. Preserve native backups, historical SQL and checksums.
 
 The package's sole PostgreSQL baseline is `scripts/deploy/baseline_v*.json`.
 Use its PostgreSQL SQL, driver and `config.example.json`. A shared version number
@@ -35,6 +43,8 @@ does not authorize changing another product's identity to OpenTenBase AgentX.
 | v5.0.0 | 102 |
 | v5.0.1 | 105 |
 | v5.0.2 | 110 |
+| v5.0.3 | 117 |
+| v5.0.4 | 120 |
 
 These versions were normal releases. Historical migration filenames describe
 when a structure was introduced, not the version to pass to a current installer.
@@ -65,15 +75,17 @@ Use the installed package's Python environment and work from its root:
 
 ```bash
 bash scripts/install_platform.sh upgrade \
-  --database pg --edition community --version 5.0.4 \
-  --from-version 5.0.2 \
+  --database pg --edition community --version 5.0.5 \
+  --from-version 5.0.4 \
   --config /absolute/path/config.json \
   --confirm-database-backup
 ```
 
-For the v5.0.2 to v5.0.3 transition, `--from-version 5.0.2` checks the actual
-predecessor objects and APPLIED checksums before any new migration. It selects
-only the backend's v5.0.3 tail above. A resumed upgrade retains the declared
+For the v5.0.4 to v5.0.5 transition, `--from-version 5.0.4` checks the actual
+predecessor objects and APPLIED checksums before any new migration. PostgreSQL
+then applies 121; the other supported backends retain terminal 119. Use the
+matching historical package for each earlier transition; this command does not
+support skipping releases. A resumed upgrade retains the declared
 predecessor in its original journal; an older undeclared journal cannot be
 relabelled as a checked transition. Do not use this argument for initialization
 or another version transition.
@@ -119,7 +131,9 @@ procedures for another database are not AgentX upgrade steps.
 | 110 (PostgreSQL) | Historical approval-constraint repair, preserving ordinary decision authority |
 | 111–116 (backend-selected subset) | Guided Knowledge metadata, native shared-write boundaries and backend-specific body search |
 | 117 | Observed Task Step start/completion times; historical unknowns stay NULL |
-| 118 (Oracle) | Explicit child document key; preserve the complete collaboration JSON projection |
+| 119 | Bounded STATUSPAGE Source kind; collection remains separate from review/promotion |
+| 120 (PostgreSQL, before 119) | Exact historical Source-kind constraint repair |
+| 121 (PostgreSQL) | ACTIVE Agent reads of its own context; no shared-context or write grant |
 
 For a v5.0.1 target, verify all three added scripts and schema manifests, including
 their actual tables, keys, constraints and native protection. A successful 105
@@ -142,10 +156,10 @@ checksum, skip a failed fragment or assume an interrupted statement committed.
 
 ```bash
 bash scripts/install_platform.sh status \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config /absolute/path/config.json --run-id YOUR_RECORDED_RUN_ID
 bash scripts/install_platform.sh resume \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config /absolute/path/config.json --run-id YOUR_RECORDED_RUN_ID
 ```
 
@@ -159,7 +173,7 @@ verified, stop and use the database's documented recovery procedure.
 
 ```bash
 bash scripts/install_platform.sh verify \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config /absolute/path/config.json
 ```
 

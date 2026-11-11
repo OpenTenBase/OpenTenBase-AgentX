@@ -1,4 +1,4 @@
-# OpenTenBase AgentX v5.0.4
+# OpenTenBase AgentX v5.0.5
 
 [简体中文](README_zh.md)
 
@@ -13,7 +13,7 @@ source synchronization and final-answer evaluation extend the existing
 Task/Step, Work/Handoff and candidate/review entities. Their permissions, exact
 revisions and explicit publication boundaries remain enforced.
 
-With the v5.0.2 runtime contract, registered model resources share durable
+Registered model resources share durable
 capacity admission and request observations. Structured retrospectives retain
 independent candidate review; approved read-only tool turns retain the existing
 Action Cards and Workers. Processing diagnosis shows consumed budgets and
@@ -24,6 +24,18 @@ and [MCP compatibility](docs/mcp-versioned-interoperability.md).
 
 This package is **OpenTenBase-AgentX**, **Community**, licensed under
 **Apache-2.0**. Supported database keys: **pg**. OpenTenBase AgentX is an independent PostgreSQL-only Community product.
+
+## Current release
+
+v5.0.5 improves management-channel stream handling, separates retrieval
+scores from evidence sufficiency, and checks bounded citation/expression rules
+before publishing shared answers. These checks do not provide a calibrated
+correctness probability or verify every claim. Knowledge/Memory pages use
+independent bounded loading; Portal policy and Agent asset navigation are
+aligned, including ordinary-HTTP request identifiers. Configured source intake
+and incident-report drafts still require independent review and promotion.
+See [release notes](RELEASE_NOTES_v5.0.5.md) and
+[answer quality](docs/answer-quality.md) for the verified boundaries.
 
 ## Install and initialize
 
@@ -41,7 +53,7 @@ archive, including `vendor/`. Work from its root:
    view is required.
 4. Store the initial password in a current-user-owned regular file, mode `0600`
    or stricter. Run `bash scripts/install_platform.sh initialize --database pg
-   --edition community --version 5.0.4 --config /absolute/path/config.json
+   --edition community --version 5.0.5 --config /absolute/path/config.json
    --admin-password-file /absolute/path/admin.password`. Keep the parameters
    `pg` and `community`. The initial password must be at least 12 characters.
 5. Run `./start_web_server.sh start`. Dashboard: `/app/`; Portal: `/portal`.
@@ -81,7 +93,7 @@ upgrade, verification and private recovery state.
 - [Security](docs/security.md) and [release verification](docs/release-signing.md)
 - [Native Agent offboarding and account-status prerequisites](docs/native-identity.md)
 - [Source IP access and local recovery](docs/source-ip-access.md)
-- [Release notes](RELEASE_NOTES_v5.0.4.md)
+- [Release notes](RELEASE_NOTES_v5.0.5.md)
 
 Model features are verified per provider and model. Controlled integrations keep
 their authorization, isolation, bounded execution and database audit checks.

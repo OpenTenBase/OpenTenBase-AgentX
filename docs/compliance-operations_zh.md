@@ -1,4 +1,4 @@
-# OpenTenBase AgentX v5.0.4 合规状态与配置档案操作
+# OpenTenBase AgentX v5.0.5 合规状态与配置档案操作
 
 > 当前软件包：**OpenTenBase AgentX**；支持底座：**pg**；版本类别：**Community**；许可：**Apache-2.0**。文中其他底座及企业专属能力用于说明差异，不表示此包包含或支持这些能力。
 

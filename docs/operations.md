@@ -1,4 +1,4 @@
-# OpenTenBase AgentX v5.0.4 Operations and Technical Documentation
+# OpenTenBase AgentX v5.0.5 Operations and Technical Documentation
 
 > Installed product: **OpenTenBase AgentX**; supported backends: **pg**; edition: **Community**; license: **Apache-2.0**. Other backends and Enterprise-only capabilities discussed below describe differences; they do not extend this package's scope.
 
@@ -46,7 +46,7 @@ install -m 600 config.example.json config.json
 # Fill in private PostgreSQL connection and security settings before continuing.
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_offline.sh --database pg
-bash scripts/install_platform.sh initialize --version 5.0.4 \
+bash scripts/install_platform.sh initialize --version 5.0.5 \
   --database pg --edition community --config "$CX_CONFIG_PATH"
 ./start_web_server.sh start
 ```
@@ -76,7 +76,7 @@ None alone proves release acceptance. Recheck deployment with:
 
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
-bash scripts/install_platform.sh verify --version 5.0.4 \
+bash scripts/install_platform.sh verify --version 5.0.5 \
   --database pg --edition community --config "$CX_CONFIG_PATH"
 ```
 
@@ -93,6 +93,10 @@ APPLIED checksums, actual predecessor structures, native protection and current
 postflight must all match; a terminal ledger row is insufficient. Older SQL
 filenames remain unchanged for journal/checksum continuity and do not authorize
 cross-product upgrades.
+
+For v5.0.5, verify the complete PostgreSQL chain through **121**, including
+120 before 119 and 121's own-context reads and other/forged/write denials.
+The current upgrade uses `--from-version 5.0.4`; follow [migration](migration.md).
 
 Record the current product, database, Owner, configuration, encryption keys,
 running writers and checksums. Complete native backup and a recovery drill.

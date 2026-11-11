@@ -1,4 +1,4 @@
-# 迁移指南 v5.0.4
+# 迁移指南 v5.0.5
 
 > 当前软件包：**OpenTenBase AgentX**；支持底座：**pg**；版本类别：**Community**；许可：**Apache-2.0**。文中其他底座及企业专属能力用于说明差异，不表示此包包含或支持这些能力。
 
@@ -12,12 +12,19 @@ OpenTenBase AgentX 仅支持 **PostgreSQL**。生成的基线清单和校验和�
 v5.0.0 通过 `102_v5_0_0_network_access.sql` 增加来源 IP 策略实体。
 v5.0.1 新增 103–105，提供记忆质量、上下文资产及最终回答验收。
 v5.0.2 新增 106–110，其中 110 修正历史审批约束。v5.0.3 保留该前序链，新增
-**111–114，再执行 117**。逐项核对所选脚本及结构清单；终点 117 本身不代表
+**111–114，再执行 117**。逐项核对所选脚本及结构清单；历史终点本身不代表
 数据库或发布验收已完成。
 
 111 保存知识入库引导元数据，112–114 实施原生知识写入保护。
 117 为 Task Step 增加可空的开始、完成时间，无默认值，也不回填历史。
 原有数据、授权及未知时间保持不变；历史时间为空不能作为步骤从未运行的证明。
+
+v5.0.4 新增 STATUSPAGE 来源类型迁移 119 及前置 120；120 仅修复受支持的精确
+历史来源约束，再执行未改写的 119。v5.0.5 追加
+`121_v5_0_5_pg_context_self_read.sql`，通过已登记原生身份恢复 ACTIVE Agent
+对自己上下文的读取。当前 PostgreSQL 终点为 **121**。核验自有读取、其他上下文、
+伪造身份和直接写入控制，不增加共享上下文或写权限。当前升级使用
+`--from-version 5.0.4`，保留原生备份、历史 SQL 和校验和。
 
 本包唯一的 PostgreSQL 基线位于 `scripts/deploy/baseline_v*.json`，仅使用包内
 PostgreSQL 脚本、驱动和 `config.example.json`。版本号相同不能授权将其他产品
@@ -32,6 +39,8 @@ PostgreSQL 脚本、驱动和 `config.example.json`。版本号相同不能授�
 | v5.0.0 | 102 |
 | v5.0.1 | 105 |
 | v5.0.2 | 110 |
+| v5.0.3 | 117 |
+| v5.0.4 | 120 |
 
 这些版本是常规发布。历史迁移文件名描述结构引入的时间，不是传给当前安装器的
 目标版本。已撤回的 v4.4.8 和未知的部分架构不被假定为升级源；保留历史证据，
@@ -57,14 +66,15 @@ DBA 负责原生备份与恢复，变更前建立并测试恢复边界。客户�
 
 ```bash
 bash scripts/install_platform.sh upgrade \
-  --database pg --edition community --version 5.0.4 \
-  --from-version 5.0.2 \
+  --database pg --edition community --version 5.0.5 \
+  --from-version 5.0.4 \
   --config /absolute/path/config.json \
   --confirm-database-backup
 ```
 
-从 v5.0.2 升到 v5.0.3 时，`--from-version 5.0.2` 会先检查前序真实结构及
-APPLIED 校验和，再仅执行上表中的本底座新增链。续跑保留原日志声明的前序版本；
+从 v5.0.4 升到 v5.0.5 时，`--from-version 5.0.4` 会先检查前序真实结构及
+APPLIED 校验和，再由 PostgreSQL 执行 121；其他受支持底座保持终点 119。
+更早版本应使用对应历史软件包逐级转换，本命令不支持跳过版本。续跑保留原日志声明的前序版本；
 旧的未声明日志不能重新标成已核验的升级。初始化和其他版本迁移不使用此参数。
 
 本产品固定使用 `--database pg --edition community`。
@@ -98,7 +108,9 @@ PostgreSQL 迁移链保留已有 Task 历史和依赖，按本包生成的 Postg
 | 110（PostgreSQL） | 修正历史审批约束，保留正常审批权限 |
 | 111–116（按底座选择） | 知识引导元数据、原生共享写入边界及底座特定的正文检索 |
 | 117 | 实际观测的步骤开始、完成时间，未知历史保持为空 |
-| 118（Oracle） | 显式子文档键，保留完整协作组 JSON 投影 |
+| 119 | 有界 STATUSPAGE 来源类型；采集与审核、晋升分开 |
+| 120（PostgreSQL，在 119 前执行） | 精确修复历史来源类型约束 |
+| 121（PostgreSQL） | ACTIVE Agent 读取自己的上下文，不增加共享上下文或写权限 |
 
 v5.0.1 目标需检查三项新脚本及结构清单，包括实际表、键、约束和原生保护。
 终点 105 账本成功不代表 103、104 对象存在。来源/模型作业复用既有任务连续性链，
@@ -114,10 +126,10 @@ PostgreSQL 在历史状态分区 Task Plan 表没有全局 PLAN_ID 键的情况�
 
 ```bash
 bash scripts/install_platform.sh status \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config /absolute/path/config.json --run-id YOUR_RECORDED_RUN_ID
 bash scripts/install_platform.sh resume \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config /absolute/path/config.json --run-id YOUR_RECORDED_RUN_ID
 ```
 
@@ -127,7 +139,7 @@ bash scripts/install_platform.sh resume \
 
 ```bash
 bash scripts/install_platform.sh verify \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config /absolute/path/config.json
 ```
 

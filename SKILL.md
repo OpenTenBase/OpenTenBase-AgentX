@@ -1,6 +1,6 @@
 # OpenTenBase AgentX / OpenTenBase AgentX
 
-Version: 5.0.4. Package: `OpenTenBase-AgentX`.
+Version: 5.0.5. Package: `OpenTenBase-AgentX`.
 Edition: Community. License: Apache-2.0.
 Supported database keys / 支持的数据库标识: `pg`.
 
@@ -32,11 +32,15 @@ is required. See [deployment](docs/deployment.md),
 [minimum privileges](docs/minimum-privileges.md) and
 [native identity](docs/native-identity.md).
 
+For v5.0.5, verify the complete PostgreSQL chain through migration 121,
+including 120 before 119, and its own-context reads and other/forged/write
+denials. Use the v5.0.4 upgrade described in [migration](docs/migration.md).
+
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_offline.sh --database pg
 bash scripts/install_platform.sh initialize \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config "$CX_CONFIG_PATH" \
   --admin-password-file /absolute/path/admin.password
 ./start_web_server.sh start
@@ -173,11 +177,15 @@ Schema Owner。是否成功以返回的实体和状态为准。
 详见[部署](docs/deployment_zh.md)、[最小权限](docs/minimum-privileges_zh.md)和
 [原生身份](docs/native-identity_zh.md)。
 
+v5.0.5 核验 PostgreSQL 至 121 的完整链，包含在 119 前执行的 120，
+以及自有上下文读取、其他上下文/伪造身份/直接写入拒绝。
+按[迁移](docs/migration_zh.md)执行从 v5.0.4 升级的流程。
+
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_offline.sh --database pg
 bash scripts/install_platform.sh initialize \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config "$CX_CONFIG_PATH" \
   --admin-password-file /absolute/path/admin.password
 ./start_web_server.sh start

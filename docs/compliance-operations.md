@@ -1,4 +1,4 @@
-# OpenTenBase AgentX v5.0.4 Compliance and Profile Operations
+# OpenTenBase AgentX v5.0.5 Compliance and Profile Operations
 
 > Installed product: **OpenTenBase AgentX**; supported backends: **pg**; edition: **Community**; license: **Apache-2.0**. Other backends and Enterprise-only capabilities discussed below describe differences; they do not extend this package's scope.
 

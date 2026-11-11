@@ -1,4 +1,4 @@
-# OpenTenBase AgentX v5.0.4 运维与技术说明（中文）
+# OpenTenBase AgentX v5.0.5 运维与技术说明（中文）
 
 > 当前软件包：**OpenTenBase AgentX**；支持底座：**pg**；版本类别：**Community**；许可：**Apache-2.0**。文中其他底座及企业专属能力用于说明差异，不表示此包包含或支持这些能力。
 
@@ -30,7 +30,7 @@ install -m 600 config.example.json config.json
 # 先填写私有 PostgreSQL 连接及安全配置，再继续。
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_offline.sh --database pg
-bash scripts/install_platform.sh initialize --version 5.0.4 \
+bash scripts/install_platform.sh initialize --version 5.0.5 \
   --database pg --edition community --config "$CX_CONFIG_PATH"
 ./start_web_server.sh start
 ```
@@ -52,7 +52,7 @@ bash scripts/install_platform.sh initialize --version 5.0.4 \
 
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
-bash scripts/install_platform.sh verify --version 5.0.4 \
+bash scripts/install_platform.sh verify --version 5.0.5 \
   --database pg --edition community --config "$CX_CONFIG_PATH"
 ```
 
@@ -66,6 +66,10 @@ bash scripts/install_platform.sh verify --version 5.0.4 \
 v5.0.0 的 102 后新增 103–105。产品身份、APPLIED 校验和、实际前序结构、原生保护及
 部署后检查必须匹配，不能只看迁移终点。历史 SQL 文件名为账本和校验连续性保留，不授权
 跨产品升级。
+
+v5.0.5 核验 PostgreSQL 至 **121** 的完整链，包括在 119 前执行的 120，
+以及 121 的自有上下文读取、其他上下文/伪造身份/直接写入拒绝。
+当前升级使用 `--from-version 5.0.4`，见[迁移](migration_zh.md)。
 
 记录当前产品、数据库、Owner、配置、加密密钥、写入进程和校验和，完成原生备份及恢复
 演练，不能重新初始化已有数据。按[迁移指南](migration_zh.md)执行固定 PostgreSQL /

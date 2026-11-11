@@ -1,4 +1,4 @@
-# 部署指南 v5.0.4
+# 部署指南 v5.0.5
 
 > 当前软件包：**OpenTenBase AgentX**；支持底座：**pg**；版本类别：**Community**；许可：**Apache-2.0**。文中其他底座及企业专属能力用于说明差异，不表示此包包含或支持这些能力。
 
@@ -61,6 +61,11 @@ python scripts/verify_deps.py --database pg
 `103_v5_0_1_memory_quality.sql`、`104_v5_0_1_context_assets.sql` 和
 `105_v5_0_1_answer_quality.sql`，每项均带结构清单。历史 SQL 和已应用校验和保持原身份。
 
+v5.0.5 继续执行 106–114、117、120、119、121；当前 PostgreSQL 终点为
+**121**，120 是在 119 前执行的前置。核验 121 的原生自有上下文读取、其他上下文/
+伪造身份/直接写入拒绝及完整历史链。从 v5.0.4 的明确升级流程见
+[迁移](migration_zh.md)，历史引入脚本不是当前终点。
+
 部署后同时核对时间/便签/复盘、上下文/资产/来源和回答质量的实际对象、APPLIED 记录
 及脚本摘要。不能用终点 105 的账本记录代替缺失的 103 或 104 对象。已有数据、Agent
 SQL 拒绝和 Task/Step/连续性依赖仍属升级验证范围；空库初始化不证明已有数据转换通过。
@@ -70,7 +75,7 @@ SQL 拒绝和 Task/Step/连续性依赖仍属升级验证范围；空库初始�
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_platform.sh initialize \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config "$CX_CONFIG_PATH" \
   --admin-password-file /absolute/path/admin.password
 ```
@@ -92,7 +97,7 @@ bash scripts/install_platform.sh initialize \
 ```bash
 export CX_CONFIG_PATH=/absolute/path/config.json
 bash scripts/install_platform.sh verify \
-  --database pg --edition community --version 5.0.4 \
+  --database pg --edition community --version 5.0.5 \
   --config "$CX_CONFIG_PATH"
 ./start_web_server.sh start
 ./start_web_server.sh status

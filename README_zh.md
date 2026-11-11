@@ -1,4 +1,4 @@
-# OpenTenBase AgentX v5.0.4
+# OpenTenBase AgentX v5.0.5
 
 [English](README.md)
 
@@ -12,7 +12,7 @@ Portal 对话分配平台托管的本地 Agent。
 绑定、配置化来源同步和最终回答验收继续使用已有 Task/Step、Work/Handoff 与候选/
 审核实体，保留权限、精确修订及显式发布边界。
 
-v5.0.2 运行契约增加已登记模型资源的持久容量准入和请求观测。结构化回顾继续
+已登记模型资源共用持久容量准入和请求观测。结构化回顾继续
 进入独立候选审核；受控只读工具轮沿用 Action Card 与 Worker。处理诊断呈现已用
 预算与显式恢复回执，MCP 按确切版本选择有界适配器。详见
 [模型容量](docs/model-endpoint-capacity_zh.md)、[模型工作流](docs/model-workflows_zh.md)、
@@ -20,6 +20,15 @@ v5.0.2 运行契约增加已登记模型资源的持久容量准入和请求观�
 
 本包名称为 **OpenTenBase-AgentX**，版本类型为 **Community**，许可证为
 **Apache-2.0**。支持的数据库标识：**pg**。OpenTenBase AgentX 是独立的 PostgreSQL 社区产品。
+
+## 当前版本
+
+v5.0.5 改进管理频道流式处理，将检索得分与证据充分性分开，并在共享问答发布前
+检查有限的引用与表达规则。这些检查不提供校准正确概率，也不逐句证明事实正确。
+知识/记忆页面采用独立、有界加载，Portal 策略和 Agent 资产导航统一布局，并兼容
+普通 HTTP 下的请求标识生成。配置化来源采集及故障报告草稿仍需独立审核和晋升。
+已验证边界见[发布说明](RELEASE_NOTES_v5.0.5.md)和
+[回答质量](docs/answer-quality_zh.md)。
 
 ## 安装与初始化
 
@@ -34,7 +43,7 @@ v5.0.2 运行契约增加已登记模型资源的持久容量准入和请求观�
    无需额外账户状态视图。
 4. 将初始密码写入当前用户拥有、权限 `0600` 或更严格的普通文件，执行
    `bash scripts/install_platform.sh initialize --database pg --edition community
-   --version 5.0.4 --config /absolute/path/config.json --admin-password-file
+   --version 5.0.5 --config /absolute/path/config.json --admin-password-file
    /absolute/path/admin.password`。保持 `pg` 和 `community`，初始密码至少 12 位。
 5. 执行 `./start_web_server.sh start`。Dashboard 为 `/app/`，Portal 为 `/portal`。
    `/api/health` 返回进程身份，`/api/ready` 检查数据库就绪状态。
@@ -70,7 +79,7 @@ python scripts/verify_deps.py --database pg
 - [安全说明](docs/security_zh.md)与[交付验证](docs/release-signing_zh.md)
 - [原生 Agent 退役与账户状态前置](docs/native-identity_zh.md)
 - [访问 IP 配置与本机恢复](docs/source-ip-access_zh.md)
-- [版本说明](RELEASE_NOTES_v5.0.4.md)
+- [版本说明](RELEASE_NOTES_v5.0.5.md)
 
 模型能力按供应商与模型逐项验证。受控集成继续执行授权、隔离、运行限额及数据库
 审计检查。社区包不包含企业版专属代码和 SQL。人用户自助注册与外部 Agent 注册

@@ -42,7 +42,7 @@ def identity(root: Path | None = None) -> dict[str, Any]:
         "brand_key": "agentx" if donated else "chuanxu",
         "brand_zh": "OpenTenBase AgentX" if donated else "川序",
         "brand_en": "OpenTenBase AgentX" if donated else "Chuanxu",
-        "version": manifest.get("version") or "5.0.5",
+        "version": manifest.get("version") or "{{VERSION}}",
         "edition": manifest.get("edition") or "Community",
         "databases": product.get("databases") or [
             (manifest.get("database") or {}).get("key") or "pg"
@@ -52,6 +52,19 @@ def identity(root: Path | None = None) -> dict[str, Any]:
         # itself stays vendor-authentic and is not a custom combined lockup.
         "logo": "/static/brand/opentenbase-mark.png" if donated else "/static/brand/chuanxu-mark.svg",
     }
+
+
+def web_shell(document: str, root: Path | None = None) -> str:
+    """Bind every SPA entry to the installed product, including shared UI bundles."""
+    payload = json.dumps(identity(root), ensure_ascii=False).replace("<", "\\u003c")
+    document = re.sub(
+        r'<script\b(?=[^>]*\bid=[\'\"]cx-product-identity[\'\"])[^>]*>.*?</script\s*>\n?',
+        '', document, flags=re.S | re.I,
+    )
+    if document.count('</head>') != 1:
+        raise ValueError('Web shell requires exactly one head boundary')
+    return document.replace('</head>',
+        '<script type="application/json" id="cx-product-identity">' + payload + '</script>\n</head>', 1)
 
 
 def release_product(manifest: dict[str, Any]) -> dict[str, Any]:

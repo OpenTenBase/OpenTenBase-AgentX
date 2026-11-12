@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictBool
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -2268,12 +2268,13 @@ def _set_session_cookie(response: Response, session: Dict[str, str], scope: str 
     )
 
 
-def _shell() -> FileResponse:
+def _shell() -> HTMLResponse:
     for path in (DIST_ROOT / "index.html", WEB_ROOT / "index.html"):
         if path.is_file():
-            # The shell contains the hashed UI bundle reference. Avoid keeping
-            # an old shell after a controlled platform upgrade.
-            return FileResponse(path, headers={"Cache-Control": "no-store"})
+            # A shared frontend rebuild may omit its build-time product tag.
+            # Bind the installed identity before the UI chooses its logo.
+            return HTMLResponse(product_identity.web_shell(path.read_text(encoding="utf-8")),
+                                headers={"Cache-Control": "no-store"})
     raise HTTPException(status_code=503, detail="Web assets are not built")
 
 
@@ -2330,12 +2331,12 @@ def readiness(response: Response) -> Dict[str, Any]:
 @app.get("/app")
 @app.get("/app/", include_in_schema=False)
 @app.get("/app/{page}")
-def shell(page: str = "monitor") -> FileResponse:
+def shell(page: str = "monitor") -> HTMLResponse:
     return _shell()
 
 
 @app.get("/register", include_in_schema=False)
-def registration_page() -> FileResponse:
+def registration_page() -> HTMLResponse:
     """Use one entry-independent registration surface for both consoles."""
     return _shell()
 

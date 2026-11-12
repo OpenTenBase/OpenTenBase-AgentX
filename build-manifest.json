@@ -17,7 +17,7 @@
   "graph_engineering": true,
   "graph_preview": false,
   "release_date": "2026-11-11",
-  "source_commit": "9899e4a66e4cca4b02195fdf84d7a39461a7e6d3",
+  "source_commit": "1c4963ea7b0bd0f3aee64496bbd219b7ca814426",
   "license": "Apache-2.0",
   "features": [],
   "session_timeout_seconds": 300,
@@ -64,14 +64,9 @@
     "delivery": "separate",
     "snapshots": {
       "pg": {
-        "revision": "9b9fa0ebf2a8a23a0829994e55f2d77d6ef633b5318dc63024cc700f4f96c64e",
-        "sha256": "fb0cdd37c08588dc8807efc94fee933b6be444894a81433706234e9c10c72e03"
+        "revision": "4bda0937160053fc52b7d38ae2c2da6d01470bb05b85b0c68bb7c591905624c2",
+        "sha256": "5b060f0d11283050d7f335d75cb0ad5c83844dafeda8bb1256d34f7a5611c42e"
       }
     }
-  },
-  "post_release_correction": {
-    "task": "v5.0.5-agentx-logo-portal-20261112",
-    "prior_source_commit": "33748daea09d21259c1810e2ae3ab032ac3dab23",
-    "scope": "SPA product identity for Dashboard login and authenticated pages; database and model runtime unchanged"
   }
 }

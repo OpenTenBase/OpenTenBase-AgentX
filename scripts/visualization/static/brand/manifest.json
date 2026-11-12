@@ -8,7 +8,7 @@
   "edition": "Community",
   "version": "5.0.5",
   "release_date": "2026-11-11",
-  "source_commit": "33748daea09d21259c1810e2ae3ab032ac3dab23",
+  "source_commit": "1c4963ea7b0bd0f3aee64496bbd219b7ca814426",
   "assets": {
     "opentenbase-mark.png": "cd90ea85f265f23de2b00bedd0fe4bdcf77521e758c658ca046d3841c786460c"
   },
